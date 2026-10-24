@@ -21,17 +21,9 @@ log = logging.getLogger("septa_mcp")
 INSTRUCTIONS = """\
 SEPTA Regional Rail (Philadelphia commuter trains) schedules and live status.
 
-- Use train_schedule for "what times do trains leave X for Y on <day>" questions, or any
-  future date. It reads SEPTA's published GTFS timetable, handles weekday/weekend/holiday
-  service, and treats through-routed trains (which change line name in Center City) as
-  one train.
 - Trains are identified by number and final destination, which is how station boards list
   them. A train's destination can be past the rider's stop or on another line's branch;
   that's normal, not a sign of the wrong train.
-- Use next_trains for "when's the next train" right now; it includes live delays.
-- Use station_departures for a station's live departure board (tracks, delays).
-- Use train_status for where a specific train number is and how late it is.
-- Use rail_alerts for service disruptions.
 - Station names are matched loosely ("Jefferson", "30th Street", "Temple"). If a name is
   ambiguous the tool returns the candidates; ask the user or pick from context.
 - Shuttle buses that replace trains (see service_alerts) are part of the trip. If an alert
@@ -211,6 +203,10 @@ async def train_schedule(
 ) -> dict:
     """Scheduled Regional Rail trains from one station to another on a given day.
 
+    Use for "what times do trains leave X for Y on <day>" questions, or any future date.
+    Reads SEPTA's published GTFS timetable, handles weekday/weekend/holiday service, and
+    treats through-routed trains (which change line name in Center City) as one train.
+
     Args:
         from_station: Boarding station, e.g. "Jefferson", "30th Street", "Swarthmore".
         to_station: Destination station.
@@ -355,7 +351,8 @@ def _with_destination(feed, train: dict) -> dict:
 
 @mcp.tool(annotations=READ_ONLY)
 async def next_trains(from_station: str, to_station: str, count: int = 5) -> dict:
-    """Next trains from one station to another right now, with live delay status.
+    """Next trains from one station to another right now, with live delay status. Use for
+    "when's the next train" questions.
 
     Uses SEPTA's real-time NextToArrive API (includes connecting trips when there is
     no direct train). Falls back to the published schedule if the live API is down.
