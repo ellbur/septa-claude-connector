@@ -121,6 +121,38 @@ def _station_error(e: Exception) -> dict:
     return {"error": str(e)}
 
 
+def _line_parts(name: str) -> set[str]:
+    """Words of a slashed line name, for matching across feeds: the alerts feed says
+    "Media/Elwyn" where GTFS says "Media/Wawa Line", so they have to match on "media"."""
+    return {p for p in (re.sub(r"[^a-z]", "", x) for x in name.lower().replace("line", "").split("/")) if p}
+
+
+def _alerts_for_lines(alerts: list[dict], line_names: list[str]) -> list[dict]:
+    """Alerts for any of the given lines, plus system-wide ("generic") ones."""
+    want = [_line_parts(n) for n in line_names]
+    return [
+        a for a in alerts
+        if a["route_id"] == "generic" or any(w & _line_parts(str(a.get("route_name", ""))) for w in want)
+    ]
+
+
+def _station_alerts(*stations) -> dict:
+    """Current alerts for the lines serving these stations, to explain an empty result.
+
+    Uses the lines the stations have in common (Suburban→Wilmington: just Wilmington/Newark,
+    not all 13 lines through Suburban); with none in common, every line serving either.
+    """
+    feed = feeds.get()
+    route_sets = [s.routes for s in stations]
+    routes = set.intersection(*route_sets) or set.union(*route_sets)
+    try:
+        alerts = realtime.rail_alerts()
+    except realtime.SeptaAPIError as e:
+        return {"alerts_error": str(e)}
+    relevant = _alerts_for_lines(alerts, [feed.route_name(r) for r in routes])
+    return {"service_alerts": relevant} if relevant else {}
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -150,7 +182,7 @@ def find_station(query: str) -> dict:
 
 
 @mcp.tool(annotations=READ_ONLY)
-def train_schedule(
+async def train_schedule(
     from_station: str,
     to_station: str,
     date: str = "today",
@@ -175,6 +207,20 @@ def train_schedule(
     trains, returns one-transfer itineraries instead. Times are scheduled, not live; for
     trips in the next hour or so, also call next_trains for delays.
     """
+    return await anyio.to_thread.run_sync(
+        lambda: _train_schedule(from_station, to_station, date, depart_after, depart_before, max_results)
+    )
+
+
+def _train_schedule(
+    from_station: str,
+    to_station: str,
+    date: str = "today",
+    depart_after: str | None = None,
+    depart_before: str | None = None,
+    max_results: int = 25,
+    with_alerts: bool = True,
+) -> dict:
     feed = feeds.get()
     try:
         origin = feed.resolve_station(from_station)
@@ -238,6 +284,8 @@ def train_schedule(
         else:
             result["trains"] = []
             result["note"] = "No scheduled service between these stations in this window."
+            if with_alerts:
+                result.update(_station_alerts(origin, dest))
 
     result["schedule_source"] = feed.summary()
     return result
@@ -260,15 +308,19 @@ async def next_trains(from_station: str, to_station: str, count: int = 5) -> dic
     base = {"from": origin.name, "to": dest.name, "as_of": fmt_time(now())}
     try:
         trains = await anyio.to_thread.run_sync(realtime.next_to_arrive, origin.name, dest.name, count)
-        return {**base, "source": "SEPTA real-time API", "trains": trains}
     except realtime.SeptaAPIError as e:
-        fallback = train_schedule(origin.stop_id, dest.stop_id, "today", max_results=count)
+        # The alerts come from the same API that just failed, so don't try for them.
+        fallback = _train_schedule(origin.stop_id, dest.stop_id, "today", max_results=count, with_alerts=False)
         return {
             **base,
             "source": "published schedule (live data unavailable)",
             "live_error": str(e),
             "trains": fallback.get("trains") or fallback.get("itineraries") or [],
         }
+    result = {**base, "source": "SEPTA real-time API", "trains": trains}
+    if not trains:
+        result.update(await anyio.to_thread.run_sync(_station_alerts, origin, dest))
+    return result
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -292,7 +344,10 @@ async def station_departures(
         board = await anyio.to_thread.run_sync(realtime.arrivals, st.name, count, direction)
     except realtime.SeptaAPIError as e:
         return {"station": st.name, "error": str(e)}
-    return {"station": st.name, **board}
+    result = {"station": st.name, **board}
+    if not any(board.values()):
+        result.update(await anyio.to_thread.run_sync(_station_alerts, st))
+    return result
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -330,16 +385,7 @@ async def rail_alerts(line: str | None = None) -> dict:
     except realtime.SeptaAPIError as e:
         return {"error": str(e)}
     if line:
-        # Match on any part of a slashed name: the alerts feed says "Media/Elwyn" where
-        # GTFS says "Media/Wawa", so "Media/Wawa" has to match on "media".
-        def parts(s: str) -> set[str]:
-            return {p for p in (re.sub(r"[^a-z]", "", x) for x in s.lower().replace("line", "").split("/")) if p}
-
-        want = parts(line)
-        alerts = [
-            a for a in alerts
-            if want & parts(str(a.get("route_name", ""))) or a["route_id"] == "generic"
-        ] or alerts
+        alerts = _alerts_for_lines(alerts, [line]) or alerts
     return {"alerts": alerts, "count": len(alerts)}
 
 

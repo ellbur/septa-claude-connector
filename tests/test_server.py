@@ -184,7 +184,29 @@ def test_rail_alerts():
 
 def test_rail_alerts_exclude_subway():
     r = call("rail_alerts", {})
-    assert [a["route_id"] for a in r["alerts"]] == ["rr_route_med"]
+    assert [a["route_id"] for a in r["alerts"]] == ["rr_route_med", "rr_route_wilm"]
+
+
+def test_empty_results_include_line_alerts():
+    r = call("next_trains", {"from_station": "Suburban", "to_station": "Wilmington"})
+    assert r["trains"] == []
+    # Only the line shared by both stations, not every line through Suburban.
+    assert [a["route_id"] for a in r["service_alerts"]] == ["rr_route_wilm"]
+
+    r = call("station_departures", {"station": "Wilmington"})
+    assert [a["route_id"] for a in r["service_alerts"]] == ["rr_route_wilm"]
+
+    r = call("train_schedule", {
+        "from_station": "Suburban", "to_station": "Wilmington",
+        "date": next_weekday(2).isoformat(), "depart_after": "02:00", "depart_before": "02:30",
+    })
+    assert r["trains"] == []
+    assert [a["route_id"] for a in r["service_alerts"]] == ["rr_route_wilm"]
+
+
+def test_nonempty_results_omit_alerts():
+    assert "service_alerts" not in call("next_trains", {"from_station": "Jefferson", "to_station": "Swarthmore"})
+    assert "service_alerts" not in call("station_departures", {"station": "Jefferson"})
 
 
 def test_live_api_down_falls_back_to_schedule(monkeypatch):

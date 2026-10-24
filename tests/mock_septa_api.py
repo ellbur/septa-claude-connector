@@ -23,6 +23,8 @@ def _clock(minutes_from_now: int) -> str:
 
 
 def next_to_arrive(q):
+    if q.get("req2") == ["Wilmington"]:  # trains replaced by buses (see ALERTS)
+        return []
     return [
         # The real API sometimes keeps serving a train hours after it left.
         {"orig_train": "5301", "orig_line": "Media/Wawa", "orig_departure_time": _clock(-300),
@@ -69,6 +71,9 @@ ALERTS = [
     {"route_id": "rr_route_med", "route_name": "Media/Elwyn", "current_message": None,
      "advisory_message": '<h3 class="separated">Track Work</h3><p>Track work near <b>Secane</b> this weekend; expect delays of up to 10 minutes.</p>',
      "detour_message": "", "last_updated": "Oct 24 2026 08:02:11:000AM"},
+    {"route_id": "rr_route_wilm", "route_name": "Wilmington/Newark", "current_message": None,
+     "advisory_message": "<p>Shuttle Busing Wilmington Station to Claymont Transit Center</p>",
+     "detour_message": "", "last_updated": ""},
     {"route_id": "rr_route_pao", "route_name": "Paoli/Thorndale", "current_message": "",
      "advisory_message": "", "detour_message": "", "last_updated": ""},
     {"route_id": "rr_route_mfo", "route_name": "Market Frankford Owl", "current_message": None,
@@ -80,7 +85,7 @@ ALERTS = [
 
 ROUTES = {
     "/api/NextToArrive/index.php": next_to_arrive,
-    "/api/Arrivals/index.php": lambda q: ARRIVALS,
+    "/api/Arrivals/index.php": lambda q: {} if q.get("station") == ["Wilmington"] else ARRIVALS,
     "/api/TrainView/index.php": lambda q: TRAIN_VIEW,
     "/api/RRSchedules/index.php": lambda q: RR_SCHEDULE if q.get("req1") == ["5317"] else BadRequest(
         f"An invalid parameter was used. No train found with train #{q.get('req1', [''])[0]}."),
