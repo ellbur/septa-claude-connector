@@ -37,7 +37,11 @@ v202609271 feed returns trains 5301, 5305, 5309, 5313, 5317 and 5321, leaving Je
 Lansdale/Doylestown train becomes a Media/Wawa train at Suburban Station). GTFS models this
 as two trips joined by an in-seat transfer, so a naive "trips serving both stations" query
 finds only a handful of the Jefferson → Swarthmore trains. This server stitches those trips
-back together, so you see every train, flagged with `through_routed`.
+back together, so you see every train.
+
+Trains are reported by number and final `destination`, the way platform boards list them,
+rather than by line. The line name a train has at your boarding station can belong to the
+other half of its run, e.g. a Suburban → Claymont train shows up as "Chestnut Hill East".
 
 **Station names differ between feeds.** The real-time API predates the current GTFS and
 uses older names for about 30 stations ("Temple U", "30th Street Station", "Ft Washington",
@@ -58,6 +62,8 @@ septa-mcp                                # stdio, for local MCP clients
 On first start it downloads the rail schedule (≈750 KB) from SEPTA, falling back to
 SEPTA's GitHub releases, and re-checks daily. SEPTA publishes a new feed every few weeks;
 results include `valid_from`/`valid_until`, and a warning if you ask about a date outside it.
+A feed's version is named for its start date, and SEPTA folds later schedule changes into the
+same feed, so results also list `timetable_changes_included` to show the data is current.
 
 ### Use it in Claude Code (development version)
 

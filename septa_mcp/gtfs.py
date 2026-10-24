@@ -324,15 +324,34 @@ class RailFeed:
                 start, end = start or min(all_dates), end or max(all_dates)
         return start, end
 
+    def timetable_changes(self) -> list[date]:
+        """Dates after the feed's start on which a new timetable period begins.
+
+        SEPTA revises a feed in place: the Oct 18 schedule change went out as an edit to
+        the feed starting Sep 27, so these show changes the feed's version date hides.
+        """
+        start, end = self.feed_range()
+        starts = {datetime.strptime(c["start_date"], "%Y%m%d").date() for c in self.calendar.values()}
+        return sorted(d for d in starts if (not start or d > start) and (not end or d <= end))
+
     def summary(self) -> dict:
         start, end = self.feed_range()
-        return {
+        out = {
             "feed_version": self.feed_info.get("feed_version"),
             "valid_from": start.isoformat() if start else None,
             "valid_until": end.isoformat() if end else None,
+            "timetable_changes_included": [d.isoformat() for d in self.timetable_changes()],
             "downloaded_from": self.source,
             "downloaded_at": datetime.fromtimestamp(self.fetched_at, TZ).isoformat(timespec="minutes"),
+            "note": (
+                "SEPTA names a feed version after the date the feed starts, not when it was "
+                "published, and adds later schedule changes to the same feed (see "
+                "timetable_changes_included). An early version date doesn't mean the data is stale."
+            ),
         }
+        if self.source.startswith("http"):
+            out["note"] += " This is the latest feed SEPTA had published at downloaded_at; it's re-checked daily."
+        return out
 
     # -- calendar ----------------------------------------------------------
 
@@ -562,8 +581,17 @@ class RailFeed:
             out.append(j)
         return out
 
-    def trip_stops(self, train: str, service_date: date) -> list[dict]:
-        active = self.services_on(service_date)
+    def destination(self, trip: Trip, active: set[str]) -> str:
+        """Where the physical train ends up, as station boards show it: through-routed
+        trains change line in Center City, so this follows the chain to its last trip."""
+        last = trip
+        for last in self._chain_forward(trip, active):
+            pass
+        if last.headsign:
+            return last.headsign
+        return self.stops[last.times[-1].stop_id].name if last.times else ""
+
+    def _train_starts(self, train: str, active: set[str]) -> list[Trip]:
         starts = [
             t for t in self.trips.values()
             if t.train == train and t.service_id in active and t.trip_id not in self.prev_trip
@@ -571,6 +599,16 @@ class RailFeed:
         if not starts:
             # The train number might only appear mid-chain.
             starts = [t for t in self.trips.values() if t.train == train and t.service_id in active]
+        return starts
+
+    def train_destination(self, train: str, service_date: date) -> str | None:
+        active = self.services_on(service_date)
+        starts = self._train_starts(train, active)
+        return self.destination(starts[0], active) if starts else None
+
+    def trip_stops(self, train: str, service_date: date) -> list[dict]:
+        active = self.services_on(service_date)
+        starts = self._train_starts(train, active)
         out = []
         for t0 in starts[:1]:
             first = True
@@ -597,23 +635,18 @@ def fmt_time(dt: datetime) -> str:
 
 
 def ride_to_dict(feed: RailFeed, r: Ride, query_date: date | None = None) -> dict:
-    lines = []
-    for t in r.trips:
-        name = feed.route_name(t.route_id)
-        if not lines or lines[-1] != name:
-            lines.append(name)
+    # Riders find their train by number and destination, which is what platform boards
+    # show. Line names are left out: a through-routed train changes line in Center City,
+    # so the line at the boarding station can look like the wrong train.
     dep, arr = r.depart_dt, r.arrive_dt
     d = {
         "train": r.train,
+        "destination": feed.destination(r.board_trip, feed.services_on(r.service_date)),
         "depart": fmt_time(dep),
         "arrive": fmt_time(arr),
         "duration_min": int((arr - dep).total_seconds() // 60),
-        "line": feed.route_name(r.alight_trip.route_id),
-        "toward": r.alight_trip.headsign,
         "intermediate_stops": r.stops_between,
     }
-    if len(lines) > 1:
-        d["through_routed"] = f"Same train runs as {' → '.join(lines)}; no transfer needed."
     if query_date and dep.date() != query_date:
         d["depart_date"] = dep.date().isoformat()
     return d

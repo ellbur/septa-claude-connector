@@ -86,11 +86,13 @@ def test_jefferson_to_swarthmore_saturday_morning():
     })
     assert r["from"] == "Jefferson Station" and r["to"] == "Swarthmore"
     assert r["weekday"] == "Saturday"
+    assert r["window"] == f"{sat:%a %b} {sat.day}, 5:00 AM – {sat:%a %b} {sat.day}, 12:00 PM"
     trains = r["trains"]
     # Saturday Media/Wawa service is roughly hourly; these are through-routed trains
     # that a naive GTFS query would miss.
     assert len(trains) >= 4
-    assert all(t["line"] == "Media/Wawa Line" for t in trains)
+    # Named by where the train ends up, as platform boards show it, not by line.
+    assert all(t["destination"] == "Wawa" and "line" not in t for t in trains)
     assert all(20 <= t["duration_min"] <= 50 for t in trains)
 
 
@@ -204,6 +206,11 @@ def test_empty_results_include_line_alerts():
     assert [a["route_id"] for a in r["service_alerts"]] == ["rr_route_wilm"]
 
 
+def test_whole_day_window_shows_it_runs_into_next_morning():
+    r = call("train_schedule", {"from_station": "Jefferson", "to_station": "Swarthmore", "date": "2026-11-01"})
+    assert r["window"] == "Sun Nov 1, 12:00 AM – Mon Nov 2, 3:30 AM"
+
+
 def test_nonempty_results_omit_alerts():
     assert "service_alerts" not in call("next_trains", {"from_station": "Jefferson", "to_station": "Swarthmore"})
     assert "service_alerts" not in call("station_departures", {"station": "Jefferson"})
@@ -214,3 +221,26 @@ def test_live_api_down_falls_back_to_schedule(monkeypatch):
     r = call("next_trains", {"from_station": "Jefferson", "to_station": "Swarthmore"})
     assert r["source"].startswith("published schedule")
     assert "live_error" in r
+
+
+def test_schedule_source_explains_feed_version():
+    src = call("train_schedule", {"from_station": "Jefferson", "to_station": "Swarthmore"})["schedule_source"]
+    start, end = src["valid_from"], src["valid_until"]
+    assert all(start < d <= end for d in src["timetable_changes_included"])
+    assert "doesn't mean the data is stale" in src["note"]
+
+
+def test_next_trains_use_destination_not_line():
+    feed = server.feeds.get()
+    today = server.now().date()
+    active = feed.services_on(today)
+    # A through-routed train running today: its live line name is the first segment's.
+    t = next(t for t in feed.trips.values() if t.service_id in active and t.trip_id in feed.next_trip
+             and t.trip_id not in feed.prev_trip)
+    live = {"train": t.train, "line": feed.route_name(t.route_id), "depart": "1:00PM"}
+    out = server._with_destination(feed, live)
+    assert list(out)[:2] == ["train", "destination"] and "line" not in out
+    last = list(feed._chain_forward(t, active))[-1]
+    assert out["destination"] == last.headsign
+    # Unknown trains keep the line, since there's nothing better to say.
+    assert server._with_destination(feed, {"train": "0000", "line": "Airport"})["line"] == "Airport"

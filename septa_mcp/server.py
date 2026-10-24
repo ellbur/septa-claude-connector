@@ -25,6 +25,9 @@ SEPTA Regional Rail (Philadelphia commuter trains) schedules and live status.
   future date. It reads SEPTA's published GTFS timetable, handles weekday/weekend/holiday
   service, and treats through-routed trains (which change line name in Center City) as
   one train.
+- Trains are identified by number and final destination, which is how station boards list
+  them. A train's destination can be past the rider's stop or on another line's branch;
+  that's normal, not a sign of the wrong train.
 - Use next_trains for "when's the next train" right now; it includes live delays.
 - Use station_departures for a station's live departure board (tracks, delays).
 - Use train_status for where a specific train number is and how late it is.
@@ -111,6 +114,11 @@ def parse_clock(s: str | None) -> dtime | None:
     if not (0 <= h < 24 and 0 <= mi < 60):
         raise ValueError(f"Invalid time '{s}'.")
     return dtime(h, mi)
+
+
+def _fmt_day_time(dt: datetime) -> str:
+    """'Sat Oct 24, 5:21 PM'."""
+    return f"{dt:%a %b} {dt.day}, {fmt_time(dt)}"
 
 
 def _station_error(e: Exception) -> dict:
@@ -250,7 +258,9 @@ def _train_schedule(
         "to": dest.name,
         "date": day.isoformat(),
         "weekday": WEEKDAYS[day.weekday()].capitalize(),
-        "window": f"{fmt_time(ws)} – {fmt_time(we)}",
+        # Dated on both ends: a bare "12:00 AM – 3:30 AM" reads as just the overnight hours
+        # when it really means the whole day through 3:30 AM the next morning.
+        "window": f"{_fmt_day_time(ws)} – {_fmt_day_time(we)}",
     }
 
     vs, ve = feed.feed_range()
@@ -291,6 +301,20 @@ def _train_schedule(
     return result
 
 
+def _with_destination(feed, train: dict) -> dict:
+    """Swap the live API's line name for the train's destination, looked up by train
+    number in the timetable. The line is the one at the boarding station, so a
+    through-routed train to Claymont shows as "Chestnut Hill East" at Suburban."""
+    today = now().date()
+    # After midnight a train may belong to yesterday's service day.
+    for day in (today, today - timedelta(days=1)):
+        dest = feed.train_destination(str(train.get("train") or ""), day)
+        if dest:
+            rest = {k: v for k, v in train.items() if k not in ("train", "line")}
+            return {"train": train.get("train"), "destination": dest, **rest}
+    return train  # not in the timetable (e.g. an extra train): the line is all there is
+
+
 @mcp.tool(annotations=READ_ONLY)
 async def next_trains(from_station: str, to_station: str, count: int = 5) -> dict:
     """Next trains from one station to another right now, with live delay status.
@@ -317,6 +341,10 @@ async def next_trains(from_station: str, to_station: str, count: int = 5) -> dic
             "live_error": str(e),
             "trains": fallback.get("trains") or fallback.get("itineraries") or [],
         }
+    trains = [_with_destination(feed, t) for t in trains]
+    for t in trains:
+        if "connection" in t:
+            t["connection"] = _with_destination(feed, t["connection"])
     result = {**base, "source": "SEPTA real-time API", "trains": trains}
     if not trains:
         result.update(await anyio.to_thread.run_sync(_station_alerts, origin, dest))
