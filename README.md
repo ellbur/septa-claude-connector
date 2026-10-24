@@ -31,6 +31,10 @@ candidates so Claude can ask which one you mean.
 v202609271 feed returns trains 5301, 5305, 5309, 5313, 5317 and 5321, leaving Jefferson at
 :38 past each hour from 6:38 AM and arriving at Swarthmore 35 minutes later.
 
+When no train reaches the destination (e.g. buses replace trains on the last stretch of a
+line), results list the alerts for the line plus `partial_service`: the trains to the
+closest station on the way that trains still reach, where riders change to the shuttle.
+
 ## Two SEPTA quirks it handles
 
 **Through-routed trains.** Most Regional Rail trains change line name in Center City (a

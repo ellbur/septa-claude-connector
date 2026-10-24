@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import date
+from datetime import date, datetime, time as dtime
 from pathlib import Path
 
 import anyio
@@ -86,7 +86,7 @@ def test_jefferson_to_swarthmore_saturday_morning():
     })
     assert r["from"] == "Jefferson Station" and r["to"] == "Swarthmore"
     assert r["weekday"] == "Saturday"
-    assert r["window"] == f"{sat:%a %b} {sat.day}, 5:00 AM – {sat:%a %b} {sat.day}, 12:00 PM"
+    assert r["window"] == f"{sat:%a %b} {sat.day}, 5:00 AM – 12:00 PM"
     trains = r["trains"]
     # Saturday Media/Wawa service is roughly hourly; these are through-routed trains
     # that a naive GTFS query would miss.
@@ -208,7 +208,53 @@ def test_empty_results_include_line_alerts():
 
 def test_whole_day_window_shows_it_runs_into_next_morning():
     r = call("train_schedule", {"from_station": "Jefferson", "to_station": "Swarthmore", "date": "2026-11-01"})
-    assert r["window"] == "Sun Nov 1, 12:00 AM – Mon Nov 2, 3:30 AM"
+    assert r["window"] == "Sun Nov 1, 12:00 AM – Mon Nov 2, 3:30 AM (next day)"
+
+
+def test_times_after_midnight_marked_next_day():
+    sat = next_weekday(5)
+    r = call("train_schedule", {
+        "from_station": "Jefferson", "to_station": "Swarthmore", "date": sat.isoformat(), "depart_after": "23:00",
+    })
+    late = [t for t in r["trains"] if t["depart"].endswith("PM")]
+    assert late and any(t["arrive"].endswith("AM (next day)") for t in late), r["trains"]
+
+
+def _cut_off_before(monkeypatch, dest_name: str):
+    """Pretend trains stop short of dest_name, as during a shuttle-bus replacement."""
+    feed = server.feeds.get()
+    real = feed.direct_rides
+    monkeypatch.setattr(feed, "direct_rides", lambda o, d, *a: [] if d.name == dest_name else real(o, d, *a))
+    monkeypatch.setattr(feed, "transfer_journeys", lambda *a: [])
+
+
+def test_partial_service_when_trains_stop_short(monkeypatch):
+    _cut_off_before(monkeypatch, "Swarthmore")
+    r = call("train_schedule", {
+        "from_station": "Jefferson", "to_station": "Swarthmore",
+        "date": next_weekday(5).isoformat(), "depart_after": "05:00", "depart_before": "12:00",
+    })
+    assert r["trains"] == []
+    # Morton is the stop before Swarthmore on the Media/Wawa Line.
+    assert r["partial_service"]["rail_service_ends_at"] == "Morton"
+    assert r["partial_service"]["trains"][0]["depart"] == "6:38 AM"
+    assert "as far as Morton" in r["note"]
+
+
+def test_partial_service_live(monkeypatch):
+    _cut_off_before(monkeypatch, "Wilmington")
+    monkeypatch.setattr(server, "now", lambda: datetime.combine(next_weekday(0), dtime(12, 0), server.TZ))
+    r = call("next_trains", {"from_station": "Suburban", "to_station": "Wilmington"})
+    assert r["trains"] == []  # the mock has no Wilmington trains
+    assert r["partial_service"]["rail_service_ends_at"] == "Claymont Transit Center"
+    assert r["partial_service"]["trains"][0]["train"] == "5317"  # from the live API (mock)
+    assert "shuttle bus from Claymont Transit Center" in r["note"]
+
+
+def test_no_partial_service_without_a_through_route():
+    r = call("train_schedule", {"from_station": "Cynwyd", "to_station": "Media",
+                                "date": next_weekday(0).isoformat(), "depart_after": "02:00", "depart_before": "02:30"})
+    assert "partial_service" not in r
 
 
 def test_nonempty_results_omit_alerts():

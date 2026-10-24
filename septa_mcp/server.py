@@ -14,7 +14,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp_types import ToolAnnotations
 
 from . import realtime
-from .gtfs import TZ, AmbiguousStation, FeedManager, StationNotFound, fmt_time, ride_to_dict
+from .gtfs import TZ, AmbiguousStation, FeedManager, StationNotFound, fmt_time, fmt_time_on, ride_to_dict
 
 log = logging.getLogger("septa_mcp")
 
@@ -34,8 +34,12 @@ SEPTA Regional Rail (Philadelphia commuter trains) schedules and live status.
 - Use rail_alerts for service disruptions.
 - Station names are matched loosely ("Jefferson", "30th Street", "Temple"). If a name is
   ambiguous the tool returns the candidates; ask the user or pick from context.
-All times are America/New_York local time. This covers Regional Rail only, not buses,
-the Metro (subway/trolley) lines, or NJ Transit/Amtrak.
+- Shuttle buses that replace trains (see service_alerts) are part of the trip. If an alert
+  says buses replace trains between two stations, plan the trip as a train to the end of
+  rail service plus the shuttle. When no train reaches the destination, results include
+  partial_service: the trains to the closest station on the way that trains still reach.
+All times are America/New_York local time. This covers Regional Rail only, not SEPTA's
+regular bus routes, the Metro (subway/trolley) lines, or NJ Transit/Amtrak.
 """
 
 mcp = MCPServer(
@@ -116,9 +120,16 @@ def parse_clock(s: str | None) -> dtime | None:
     return dtime(h, mi)
 
 
-def _fmt_day_time(dt: datetime) -> str:
-    """'Sat Oct 24, 5:21 PM'."""
-    return f"{dt:%a %b} {dt.day}, {fmt_time(dt)}"
+def _fmt_window(start: datetime, end: datetime) -> str:
+    """'Sat Oct 31, 5:00 AM – 12:00 PM', or for one running past midnight
+    'Sun Oct 25, 12:00 AM – Mon Oct 26, 3:30 AM (next day)'. A bare "12:00 AM – 3:30 AM"
+    reads as just the overnight hours when it means the whole day."""
+    def day(dt: datetime) -> str:
+        return f"{dt:%a %b} {dt.day}"
+
+    if end.date() == start.date():
+        return f"{day(start)}, {fmt_time(start)} – {fmt_time(end)}"
+    return f"{day(start)}, {fmt_time(start)} – {day(end)}, {fmt_time(end)} (next day)"
 
 
 def _station_error(e: Exception) -> dict:
@@ -258,9 +269,7 @@ def _train_schedule(
         "to": dest.name,
         "date": day.isoformat(),
         "weekday": WEEKDAYS[day.weekday()].capitalize(),
-        # Dated on both ends: a bare "12:00 AM – 3:30 AM" reads as just the overnight hours
-        # when it really means the whole day through 3:30 AM the next morning.
-        "window": f"{_fmt_day_time(ws)} – {_fmt_day_time(we)}",
+        "window": _fmt_window(ws, we),
     }
 
     vs, ve = feed.feed_range()
@@ -282,8 +291,8 @@ def _train_schedule(
             result["note"] = "No direct trains; these itineraries need one transfer."
             result["itineraries"] = [
                 {
-                    "depart": fmt_time(l1.depart_dt),
-                    "arrive": fmt_time(l2.arrive_dt),
+                    "depart": fmt_time_on(l1.depart_dt, day),
+                    "arrive": fmt_time_on(l2.arrive_dt, day),
                     "duration_min": int((l2.arrive_dt - l1.depart_dt).total_seconds() // 60),
                     "transfer_at": feed.stops[l1.alight.stop_id].name,
                     "transfer_wait_min": int((l2.depart_dt - l1.arrive_dt).total_seconds() // 60),
@@ -296,9 +305,38 @@ def _train_schedule(
             result["note"] = "No scheduled service between these stations in this window."
             if with_alerts:
                 result.update(_station_alerts(origin, dest))
+            partial = _partial_service(feed, origin, dest, ws, we)
+            if partial:
+                end, rides = partial
+                result["partial_service"] = {
+                    "rail_service_ends_at": end.name,
+                    "trains": [ride_to_dict(feed, r, day) for r in rides[:max_results]],
+                }
+                result["note"] = _partial_note(dest, end, "service_alerts" in result)
 
     result["schedule_source"] = feed.summary()
     return result
+
+
+def _partial_service(feed, origin, dest, ws: datetime, we: datetime):
+    """When no train reaches dest, the station closest to dest on the way that trains do
+    reach in the window, with those trains: during a shuttle-bus replacement this is where
+    riders change to the bus (Claymont, for Wilmington). None if trains reach none of them."""
+    for stop in reversed(feed.stops_between(origin, dest)):
+        rides = feed.direct_rides(origin, stop, ws, we)
+        if rides:
+            return stop, rides
+    return None
+
+
+def _partial_note(dest, end, have_alerts: bool) -> str:
+    note = (
+        f"No trains reach {dest.name} in this window, but trains still run as far as "
+        f"{end.name}, the closest station on the way (see partial_service)."
+    )
+    if have_alerts:
+        note += f" Check service_alerts for a shuttle bus from {end.name} to {dest.name}."
+    return note
 
 
 def _with_destination(feed, train: dict) -> dict:
@@ -340,6 +378,7 @@ async def next_trains(from_station: str, to_station: str, count: int = 5) -> dic
             "source": "published schedule (live data unavailable)",
             "live_error": str(e),
             "trains": fallback.get("trains") or fallback.get("itineraries") or [],
+            **{k: fallback[k] for k in ("partial_service", "note") if k in fallback},
         }
     trains = [_with_destination(feed, t) for t in trains]
     for t in trains:
@@ -348,7 +387,29 @@ async def next_trains(from_station: str, to_station: str, count: int = 5) -> dic
     result = {**base, "source": "SEPTA real-time API", "trains": trains}
     if not trains:
         result.update(await anyio.to_thread.run_sync(_station_alerts, origin, dest))
+        result.update(await _live_partial_service(feed, origin, dest, count, "service_alerts" in result))
     return result
+
+
+async def _live_partial_service(feed, origin, dest, count: int, have_alerts: bool) -> dict:
+    """next_trains' version of _partial_service: the timetable finds where rail service
+    ends tonight, then the live API gives that station's trains."""
+    current = now()
+    end_of_service = datetime.combine(current.date() + timedelta(days=1), dtime(3, 30), TZ)
+    partial = await anyio.to_thread.run_sync(_partial_service, feed, origin, dest, current, end_of_service)
+    if not partial:
+        return {}
+    end, rides = partial
+    out: dict = {"rail_service_ends_at": end.name}
+    try:
+        live = await anyio.to_thread.run_sync(realtime.next_to_arrive, origin.name, end.name, count)
+        out["trains"] = [_with_destination(feed, t) for t in live]
+    except realtime.SeptaAPIError:
+        live = []
+    if not live:
+        out["trains"] = [ride_to_dict(feed, r, current.date()) for r in rides[:count]]
+        out["source"] = "published schedule"
+    return {"partial_service": out, "note": _partial_note(dest, end, have_alerts)}
 
 
 @mcp.tool(annotations=READ_ONLY)

@@ -219,6 +219,7 @@ class RailFeed:
         self.next_trip: dict[str, str] = {}
         self.prev_trip: dict[str, str] = {}
         self.feed_info: dict = {}
+        self._between_cache: dict[tuple[str, str], list[Stop]] = {}
         self._load(rail_zip)
         self._name_index = {normalize(s.name): s for s in self.stops.values()}
 
@@ -581,6 +582,36 @@ class RailFeed:
             out.append(j)
         return out
 
+    def stops_between(self, origin: Stop, dest: Stop) -> list[Stop]:
+        """Stations a train passes between origin and dest, in order, on any day in the
+        feed. Uses the stopping pattern with the most stops, so locals' stations are all
+        there. Empty when no train ever runs origin → dest directly."""
+        key = (origin.stop_id, dest.stop_id)
+        if key in self._between_cache:
+            return self._between_cache[key]
+        every_service = set(self.calendar) | set(self.cal_add)
+        best: list[str] = []
+        for trip, i in self.stop_index.get(origin.stop_id, []):
+            path: list[str] = []
+            first = True
+            for seg in self._chain_forward(trip, every_service):
+                for st in seg.times[i + 1 if first else 1:]:
+                    if st.stop_id == dest.stop_id:
+                        if len(path) > len(best):
+                            best = path
+                        path = []
+                        break
+                    if st.stop_id == origin.stop_id:
+                        path = []
+                        break
+                    path.append(st.stop_id)
+                else:
+                    first = False
+                    continue
+                break
+        self._between_cache[key] = [self.stops[s] for s in best if s in self.stops]
+        return self._between_cache[key]
+
     def destination(self, trip: Trip, active: set[str]) -> str:
         """Where the physical train ends up, as station boards show it: through-routed
         trains change line in Center City, so this follows the chain to its last trip."""
@@ -634,6 +665,11 @@ def fmt_time(dt: datetime) -> str:
     return dt.strftime("%I:%M %p").lstrip("0")
 
 
+def fmt_time_on(dt: datetime, query_date: date | None) -> str:
+    """fmt_time, marked "(next day)" when it falls after the day the rider asked about."""
+    return fmt_time(dt) + (" (next day)" if query_date and dt.date() > query_date else "")
+
+
 def ride_to_dict(feed: RailFeed, r: Ride, query_date: date | None = None) -> dict:
     # Riders find their train by number and destination, which is what platform boards
     # show. Line names are left out: a through-routed train changes line in Center City,
@@ -642,8 +678,8 @@ def ride_to_dict(feed: RailFeed, r: Ride, query_date: date | None = None) -> dic
     d = {
         "train": r.train,
         "destination": feed.destination(r.board_trip, feed.services_on(r.service_date)),
-        "depart": fmt_time(dep),
-        "arrive": fmt_time(arr),
+        "depart": fmt_time_on(dep, query_date),
+        "arrive": fmt_time_on(arr, query_date),
         "duration_min": int((arr - dep).total_seconds() // 60),
         "intermediate_stops": r.stops_between,
     }
