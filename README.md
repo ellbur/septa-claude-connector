@@ -59,6 +59,20 @@ On first start it downloads the rail schedule (≈750 KB) from SEPTA, falling ba
 SEPTA's GitHub releases, and re-checks daily. SEPTA publishes a new feed every few weeks;
 results include `valid_from`/`valid_until`, and a warning if you ask about a date outside it.
 
+### Use it in Claude Code (development version)
+
+The repo includes a `.mcp.json`, so starting `claude` in a checkout loads the server from
+your working copy. It needs [uv](https://docs.astral.sh/uv/), which builds a `.venv` from
+`uv.lock` on first start and installs the package in editable mode:
+
+```bash
+git clone https://github.com/ellbur/septa-claude-connector && cd septa-claude-connector
+claude          # approve the "septa" server when prompted, then check with /mcp
+```
+
+Code edits take effect the next time the server starts: restart Claude Code, or reconnect
+from `/mcp`.
+
 ### Add it to Claude as a custom connector
 
 Claude's custom connectors need a public HTTPS URL, so deploy the server somewhere first.
@@ -98,8 +112,7 @@ For local use only, point a desktop MCP client at the stdio command instead:
 ## Tests
 
 ```bash
-pip install -e ".[dev]"
-pytest -q
+uv run --extra dev pytest -q      # or: pip install -e ".[dev]" && pytest -q
 SEPTA_LIVE=1 pytest -q tests/test_live.py   # against SEPTA's real servers
 ```
 
