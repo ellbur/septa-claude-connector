@@ -330,11 +330,15 @@ async def rail_alerts(line: str | None = None) -> dict:
     except realtime.SeptaAPIError as e:
         return {"error": str(e)}
     if line:
-        key = re.sub(r"[^a-z]", "", line.lower().replace("line", ""))
+        # Match on any part of a slashed name: the alerts feed says "Media/Elwyn" where
+        # GTFS says "Media/Wawa", so "Media/Wawa" has to match on "media".
+        def parts(s: str) -> set[str]:
+            return {p for p in (re.sub(r"[^a-z]", "", x) for x in s.lower().replace("line", "").split("/")) if p}
+
+        want = parts(line)
         alerts = [
             a for a in alerts
-            if key in re.sub(r"[^a-z]", "", str(a.get("route_name", "")).lower())
-            or a["route_id"] == "generic"
+            if want & parts(str(a.get("route_name", ""))) or a["route_id"] == "generic"
         ] or alerts
     return {"alerts": alerts, "count": len(alerts)}
 

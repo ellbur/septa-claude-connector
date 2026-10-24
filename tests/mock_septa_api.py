@@ -10,15 +10,29 @@ from __future__ import annotations
 import json
 import sys
 import threading
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
-NEXT_TO_ARRIVE = [
-    {"orig_train": "5317", "orig_line": "Media/Wawa", "orig_departure_time": "10:38AM",
-     "orig_arrival_time": "11:13AM", "orig_delay": "3 min", "isdirect": "true"},
-    {"orig_train": "5321", "orig_line": "Media/Wawa", "orig_departure_time": "11:38AM",
-     "orig_arrival_time": "12:13PM", "orig_delay": "On time", "isdirect": "true"},
-]
+
+def _clock(minutes_from_now: int) -> str:
+    """'1:38PM', SEPTA's NextToArrive time format."""
+    t = datetime.now(ZoneInfo("America/New_York")) + timedelta(minutes=minutes_from_now)
+    return f"{t.hour % 12 or 12}:{t.minute:02d}{'AM' if t.hour < 12 else 'PM'}"
+
+
+def next_to_arrive(q):
+    return [
+        # The real API sometimes keeps serving a train hours after it left.
+        {"orig_train": "5301", "orig_line": "Media/Wawa", "orig_departure_time": _clock(-300),
+         "orig_arrival_time": _clock(-265), "orig_delay": "4 mins", "isdirect": "true"},
+        {"orig_train": "5317", "orig_line": "Media/Wawa", "orig_departure_time": _clock(10),
+         "orig_arrival_time": _clock(45), "orig_delay": "3 min", "isdirect": "true"},
+        {"orig_train": "5321", "orig_line": "Media/Wawa", "orig_departure_time": _clock(70),
+         "orig_arrival_time": _clock(105), "orig_delay": "On time", "isdirect": "true"},
+    ][: int(q.get("req3", ["5"])[0]) + 1]
+
 
 ARRIVALS = {
     "Jefferson Departures: October 24, 2026, 10:20 am": [
@@ -51,24 +65,39 @@ RR_SCHEDULE = [
 ]
 
 ALERTS = [
-    {"route_id": "rr_route_med", "route_name": "Media/Wawa", "current_message": "",
-     "advisory_message": "<p>Track work near <b>Secane</b> this weekend; expect delays of up to 10 minutes.</p>",
+    # The alerts feed still calls this line "Media/Elwyn".
+    {"route_id": "rr_route_med", "route_name": "Media/Elwyn", "current_message": None,
+     "advisory_message": '<h3 class="separated">Track Work</h3><p>Track work near <b>Secane</b> this weekend; expect delays of up to 10 minutes.</p>',
      "detour_message": "", "last_updated": "Oct 24 2026 08:02:11:000AM"},
     {"route_id": "rr_route_pao", "route_name": "Paoli/Thorndale", "current_message": "",
      "advisory_message": "", "detour_message": "", "last_updated": ""},
+    {"route_id": "rr_route_mfo", "route_name": "Market Frankford Owl", "current_message": None,
+     "advisory_message": "<p>Owl buses replace trains overnight.</p>", "detour_message": None,
+     "last_updated": ""},
     {"route_id": "bus_route_42", "route_name": "42", "current_message": "Detour",
      "advisory_message": "", "detour_message": "", "last_updated": ""},
 ]
 
 ROUTES = {
-    "/api/NextToArrive/index.php": lambda q: NEXT_TO_ARRIVE[: int(q.get("req3", ["5"])[0])],
+    "/api/NextToArrive/index.php": next_to_arrive,
     "/api/Arrivals/index.php": lambda q: ARRIVALS,
     "/api/TrainView/index.php": lambda q: TRAIN_VIEW,
-    "/api/RRSchedules/index.php": lambda q: RR_SCHEDULE if q.get("req1") == ["5317"] else [],
+    "/api/RRSchedules/index.php": lambda q: RR_SCHEDULE if q.get("req1") == ["5317"] else BadRequest(
+        f"An invalid parameter was used. No train found with train #{q.get('req1', [''])[0]}."),
     "/api/Alerts/get_alert_data.php": lambda q: ALERTS,
 }
 
 REQUESTS: list[tuple[str, dict]] = []
+
+# Station spellings the real NextToArrive rejects (with HTTP 400), e.g. the GTFS names.
+NTA_INVALID = {"Gray 30th St Station", "Wayne", "Morton-Rutledge", "Fort Washington"}
+
+
+class BadRequest(dict):
+    """Real API errors are HTTP 400 with a JSON {"error": ...} body."""
+
+    def __init__(self, msg: str):
+        super().__init__(error=msg)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -77,8 +106,13 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         REQUESTS.append((u.path, q))
         fn = ROUTES.get(u.path)
-        body = json.dumps(fn(q) if fn else {"error": "not found"}).encode()
-        self.send_response(200 if fn else 404)
+        data = fn(q) if fn else {"error": "not found"}
+        if u.path.startswith("/api/NextToArrive"):
+            bad = [n for n in q.get("req1", []) + q.get("req2", []) if n in NTA_INVALID]
+            if bad:
+                data = BadRequest(f"An error has occurred. '{bad[0]}' is not a valid station,")
+        body = json.dumps(data).encode()
+        self.send_response(400 if isinstance(data, BadRequest) else 200 if fn else 404)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(body)

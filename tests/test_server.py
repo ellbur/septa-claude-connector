@@ -24,8 +24,11 @@ os.environ["SEPTA_API_BASE"] = f"http://127.0.0.1:{_mock.server_port}/api"
 
 from mcp import Client  # noqa: E402
 
-from septa_mcp import server  # noqa: E402
+from septa_mcp import realtime, server  # noqa: E402
 from septa_mcp.server import parse_clock, parse_date  # noqa: E402
+
+# In case realtime was imported (e.g. by test_live.py) before the env var was set.
+realtime.BASE_URL = os.environ["SEPTA_API_BASE"]
 
 
 def call(tool: str, args: dict) -> dict:
@@ -120,10 +123,9 @@ def test_next_trains_live():
     mock_septa_api.REQUESTS.clear()
     r = call("next_trains", {"from_station": "Jefferson", "to_station": "Swarthmore", "count": 2})
     assert r["source"] == "SEPTA real-time API"
-    assert r["trains"][0] == {
-        "train": "5317", "line": "Media/Wawa", "depart": "10:38AM", "arrive": "11:13AM",
-        "status": "3 min", "direct": True,
-    }
+    # 5301 left hours ago; the real API still lists such trains and they must be dropped.
+    assert [t["train"] for t in r["trains"]] == ["5317", "5321"]
+    assert r["trains"][0]["status"] == "3 min" and r["trains"][0]["direct"] is True
     path, q = mock_septa_api.REQUESTS[-1]
     assert q["req1"] == ["Jefferson Station"] and q["req2"] == ["Swarthmore"]
 
@@ -132,7 +134,21 @@ def test_api_station_name_translation():
     mock_septa_api.REQUESTS.clear()
     call("next_trains", {"from_station": "Temple", "to_station": "Morton"})
     _, q = mock_septa_api.REQUESTS[-1]
-    assert q["req1"] == ["Temple U"] and q["req2"] == ["Morton-Rutledge"]
+    assert q["req1"] == ["Temple U"] and q["req2"] == ["Morton"]
+
+    r = call("next_trains", {"from_station": "30th Street", "to_station": "Wayne"})
+    assert r["source"] == "SEPTA real-time API", r
+    _, q = mock_septa_api.REQUESTS[-1]
+    assert q["req1"] == ["30th Street Station"] and q["req2"] == ["Wayne Station"]
+
+    call("station_departures", {"station": "Wayne"})
+    _, q = mock_septa_api.REQUESTS[-1]
+    assert q["station"] == ["Wayne"]  # Arrivals wants the plain name
+
+
+def test_api_error_message_surfaces():
+    with pytest.raises(realtime.SeptaAPIError, match="'Fort Washington' is not a valid station"):
+        realtime._get("/NextToArrive/index.php", {"req1": "Fort Washington", "req2": "Jefferson Station"})
 
 
 def test_station_departures():
@@ -148,16 +164,30 @@ def test_train_status():
     assert r["position"]["minutes_late"] == 3
     assert r["position"]["next_stop"] == "Jefferson Station"
     assert r["stops"][1]["estimated"] == "10:41 am"
+    assert r["stops"][1]["actual"] is None  # SEPTA's "na"
+
+
+def test_train_status_unknown_train():
+    r = call("train_status", {"train_number": "9999"})
+    assert r["position"] is None
+    assert "No train found" in r["stops_error"]
 
 
 def test_rail_alerts():
     r = call("rail_alerts", {"line": "Media/Wawa Line"})
     assert r["count"] == 1
-    assert r["alerts"][0]["advisory"].startswith("Track work near Secane")
+    assert r["alerts"][0]["advisory"] == (
+        "Track Work\nTrack work near Secane this weekend; expect delays of up to 10 minutes."
+    )
+    assert "last_updated" not in r["alerts"][0]
+
+
+def test_rail_alerts_exclude_subway():
+    r = call("rail_alerts", {})
+    assert [a["route_id"] for a in r["alerts"]] == ["rr_route_med"]
 
 
 def test_live_api_down_falls_back_to_schedule(monkeypatch):
-    from septa_mcp import realtime
     monkeypatch.setattr(realtime, "BASE_URL", "http://127.0.0.1:9/api")
     r = call("next_trains", {"from_station": "Jefferson", "to_station": "Swarthmore"})
     assert r["source"].startswith("published schedule")

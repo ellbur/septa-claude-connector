@@ -1,7 +1,8 @@
 """Thin client for SEPTA's real-time JSON API (https://www3.septa.org/api/).
 
 The real-time API predates the current GTFS feed and uses its own station names for
-a handful of stops; `api_station_name` translates GTFS names to the ones it accepts.
+a couple dozen stops; `api_station_name` translates GTFS names to the ones it accepts.
+Bad parameters come back as HTTP 400 with a JSON {"error": ...} body.
 """
 
 from __future__ import annotations
@@ -10,35 +11,62 @@ import html
 import json
 import os
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 BASE_URL = os.environ.get("SEPTA_API_BASE", "https://www3.septa.org/api")
 USER_AGENT = "septa-mcp/0.1"
 TIMEOUT = float(os.environ.get("SEPTA_API_TIMEOUT", "10"))
+TZ = ZoneInfo("America/New_York")
 
 # GTFS stop_name -> name the real-time API expects (only where they differ).
+# Checked against the live NextToArrive and Arrivals endpoints for every GTFS station.
 _API_NAMES = {
+    "9th St Lansdale": "9th Street Lansdale",
     "Airport Terminals C & D": "Airport Terminal C-D",
     "Airport Terminals E & F": "Airport Terminal E-F",
     "Chelten Av": "Chelten Avenue",
-    "Chester Transit Center": "Chester T.C.",
+    "Chester Transit Center": "Chester TC",
+    "Churchman's Crossing": "Churchmans Crossing",
     "Claymont Transit Center": "Claymont",
-    "Highland Av": "Highland Avenue",
-    "Main St": "Main Street",
-    "Morton": "Morton-Rutledge",
-    "Prospect Park": "Prospect Park - Moore",
+    "Delaware Valley University": "Delaware Valley College",
+    "Eastwick": "Eastwick Station",
+    "Elwyn": "Elwyn Station",
+    "Fern Rock Transit Center": "Fern Rock TC",
+    "Fernwood-Yeadon": "Fernwood",
+    "Fort Washington": "Ft Washington",
+    "Gray 30th St Station": "30th Street Station",
+    "Highland Av": "Highland Ave",
+    "Holmesburg Junction": "Holmesburg Jct",
+    "Mount Airy": "Mt Airy",
+    "Newark DE": "Newark",
+    "Norristown Elm Street": "Elm St",
+    "Norristown Transit Center": "Norristown TC",
+    "North Broad": "North Broad St",
+    # The real-time API has a single "North Philadelphia" for both stations.
+    "North Philadelphia Amtrak": "North Philadelphia",
+    "North Philadelphia Septa": "North Philadelphia",
     "Queen Ln": "Queen Lane",
-    "Richard Allen Ln": "Richard Allen Lane",
+    "Richard Allen Ln": "Allen Lane",
     "Temple University": "Temple U",
     "Trenton Transit Center": "Trenton",
     "Washington Ln": "Washington Lane",
     "Wynnefield Av": "Wynnefield Avenue",
 }
 
+# NextToArrive alone wants these (Arrivals rejects them and takes the GTFS name).
+_NTA_NAMES = {
+    "Wayne": "Wayne Station",
+}
 
-def api_station_name(gtfs_name: str) -> str:
+
+def api_station_name(gtfs_name: str, next_to_arrive: bool = False) -> str:
+    if next_to_arrive and gtfs_name in _NTA_NAMES:
+        return _NTA_NAMES[gtfs_name]
     return _API_NAMES.get(gtfs_name, gtfs_name)
 
 
@@ -55,6 +83,13 @@ def _get(path: str, params: dict[str, Any] | None = None) -> Any:
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
             body = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        # SEPTA reports bad stations / unknown trains as 400 {"error": "..."}.
+        try:
+            msg = json.loads(e.read().decode("utf-8", "replace"))["error"]
+        except Exception:  # noqa: BLE001
+            raise SeptaAPIError(f"SEPTA real-time API returned HTTP {e.code}") from e
+        raise SeptaAPIError(f"SEPTA API error: {html.unescape(str(msg))}") from e
     except Exception as e:  # noqa: BLE001
         raise SeptaAPIError(f"SEPTA real-time API unreachable ({e})") from e
     body = body.strip()
@@ -74,7 +109,7 @@ def _boolish(v: Any) -> bool:
 
 
 def _clean(v: Any) -> Any:
-    if v in (None, "", "null"):
+    if v in (None, "", "null", "na"):
         return None
     return v
 
@@ -91,7 +126,7 @@ def _clock(v: Any) -> Any:
 def _strip_html(v: Any) -> str | None:
     if not v:
         return None
-    text = re.sub(r"<br\s*/?>|</p>|</li>", "\n", str(v), flags=re.I)
+    text = re.sub(r"<br\s*/?>|</(?:p|li|div|h[1-6])>", "\n", str(v), flags=re.I)
     text = html.unescape(re.sub(r"<[^>]+>", "", text))
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n\s*\n+", "\n", text).strip()
@@ -101,13 +136,36 @@ def _strip_html(v: Any) -> str | None:
 # -- endpoints -----------------------------------------------------------------
 
 
-def next_to_arrive(origin: str, dest: str, count: int = 5) -> list[dict]:
+def _is_stale(depart: Any, delay: Any, now: datetime) -> bool:
+    """NextToArrive sometimes keeps listing a train hours after it left (e.g. a 7:09AM
+    departure still shown at 1PM). Treat anything well past its departure as gone."""
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*([AP])M\s*", str(depart or ""), re.I)
+    if not m:
+        return False
+    h = int(m.group(1)) % 12 + (12 if m.group(3).upper() == "P" else 0)
+    dt = now.replace(hour=h, minute=int(m.group(2)), second=0, microsecond=0)
+    if dt - now > timedelta(hours=12):  # e.g. 11:50PM seen at 12:10AM
+        dt -= timedelta(days=1)
+    elif now - dt > timedelta(hours=12):  # e.g. 12:10AM seen at 11:50PM
+        dt += timedelta(days=1)
+    late = re.match(r"\s*(\d+)", str(delay or ""))
+    return dt + timedelta(minutes=int(late.group(1)) if late else 0) + timedelta(minutes=30) < now
+
+
+def next_to_arrive(origin: str, dest: str, count: int = 5, now: datetime | None = None) -> list[dict]:
+    now = now or datetime.now(TZ)
     data = _get(
         "/NextToArrive/index.php",
-        {"req1": api_station_name(origin), "req2": api_station_name(dest), "req3": count},
+        {
+            "req1": api_station_name(origin, next_to_arrive=True),
+            "req2": api_station_name(dest, next_to_arrive=True),
+            "req3": count,
+        },
     )
     out = []
     for r in data if isinstance(data, list) else []:
+        if _is_stale(r.get("orig_departure_time"), r.get("orig_delay"), now):
+            continue
         item = {
             "train": r.get("orig_train"),
             "line": r.get("orig_line"),
@@ -207,12 +265,18 @@ def train_schedule_live(train: str) -> list[dict]:
     return out
 
 
+# The alerts feed files the subway and NHSL under rr_route_* too.
+_NOT_REGIONAL_RAIL = {"rr_route_bsl", "rr_route_bso", "rr_route_mfl", "rr_route_mfo", "rr_route_nhsl"}
+
+
 def rail_alerts() -> list[dict]:
     data = _get("/Alerts/get_alert_data.php")
     out = []
     for r in data if isinstance(data, list) else []:
         rid = str(r.get("route_id", ""))
         if not rid.startswith("rr_route") and rid != "generic":
+            continue
+        if rid in _NOT_REGIONAL_RAIL:
             continue
         msgs = {
             "current": _strip_html(r.get("current_message")),
@@ -225,8 +289,9 @@ def rail_alerts() -> list[dict]:
             {
                 "route_id": rid,
                 "route_name": r.get("route_name"),
+                # last_updated is deliberately dropped: it's the route row's timestamp
+                # (years old for most lines), not when the message was posted.
                 **{k: v for k, v in msgs.items() if v},
-                "last_updated": r.get("last_updated"),
             }
         )
     return out

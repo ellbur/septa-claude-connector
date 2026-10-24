@@ -40,8 +40,10 @@ finds only a handful of the Jefferson → Swarthmore trains. This server stitche
 back together, so you see every train, flagged with `through_routed`.
 
 **Station names differ between feeds.** The real-time API predates the current GTFS and
-uses older names for some stations ("Temple U", "Morton-Rutledge", "Prospect Park - Moore").
-`realtime.py` translates automatically.
+uses older names for about 30 stations ("Temple U", "30th Street Station", "Ft Washington",
+"Elwyn Station"), and its endpoints don't even agree with each other (NextToArrive wants
+"Wayne Station", Arrivals wants "Wayne"). `realtime.py` translates automatically; the map is
+checked against the live API by `tests/test_live.py`.
 
 ## Run it
 
@@ -98,6 +100,7 @@ For local use only, point a desktop MCP client at the stdio command instead:
 ```bash
 pip install -e ".[dev]"
 pytest -q
+SEPTA_LIVE=1 pytest -q tests/test_live.py   # against SEPTA's real servers
 ```
 
 Schedule tests run against the real GTFS feed (downloaded, or `SEPTA_GTFS_ZIP`).
