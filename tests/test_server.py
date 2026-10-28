@@ -11,6 +11,7 @@ import io
 import json
 import os
 import sys
+import zipfile
 from datetime import date, datetime, time as dtime
 from pathlib import Path
 
@@ -25,7 +26,7 @@ os.environ["SEPTA_API_BASE"] = f"http://127.0.0.1:{_mock.server_port}/api"
 
 from mcp import Client  # noqa: E402
 
-from septa_mcp import gtfs, realtime, server  # noqa: E402
+from septa_mcp import gtfs, metro, realtime, server  # noqa: E402
 from septa_mcp.server import parse_clock, parse_date  # noqa: E402
 
 # In case realtime was imported (e.g. by test_live.py) before the env var was set.
@@ -216,7 +217,7 @@ def test_train_status_unknown_train():
 
 
 def test_rail_alerts():
-    r = call("rail_alerts", {"line": "Media/Wawa Line"})
+    r = call("service_alerts", {"line": "Media/Wawa Line"})
     assert r["count"] == 1
     assert r["alerts"][0]["advisory"] == (
         "Track Work\nTrack work near Secane this weekend; expect delays of up to 10 minutes."
@@ -224,9 +225,30 @@ def test_rail_alerts():
     assert "last_updated" not in r["alerts"][0]
 
 
-def test_rail_alerts_exclude_subway():
-    r = call("rail_alerts", {})
+def test_alerts_by_mode():
+    r = call("service_alerts", {"mode": "regional_rail"})
+    # The alerts feed files the subway under rr_route_* too.
     assert [a["route_id"] for a in r["alerts"]] == ["rr_route_med", "rr_route_wilm"]
+    r = call("service_alerts", {"mode": "metro"})
+    assert [(a["route_id"], a["lines"]) for a in r["alerts"]] == [
+        ("rr_route_mfo", ["L1"]), ("trolley_route_10", ["T1"])
+    ]
+
+
+def test_alerts_without_filters_summarize_buses():
+    r = call("service_alerts", {})
+    assert {a["mode"] for a in r["alerts"]} == {"regional_rail", "metro"}  # no app or bus rows
+    assert r["bus_routes_with_alerts"] == ["42"]
+
+
+def test_alerts_by_line_across_modes():
+    assert [a["route_id"] for a in call("service_alerts", {"line": "MFL"})["alerts"]] == ["rr_route_mfo"]
+    assert [a["route_id"] for a in call("service_alerts", {"line": "Route 10"})["alerts"]] == ["trolley_route_10"]
+    (bus,) = call("service_alerts", {"line": "42"})["alerts"]
+    assert bus["detour"].startswith("EB via Spruce St")
+    assert (bus["detour_from"], bus["detour_starts"]) == ("Spruce & 38th", "10/26/2026 7:41 AM")
+    r = call("service_alerts", {"line": "T3"})
+    assert r["alerts"] == [] and "Media/Elwyn" in r["lines_with_alerts"]
 
 
 def test_empty_results_include_line_alerts():
@@ -377,3 +399,173 @@ def test_next_trains_connection_names_each_legs_stations():
     assert (t["board_at"], t["get_off_at"]) == ("Wayne", "Temple University")  # API name translated
     c = t["connection"]
     assert (c["board_at"], c["get_off_at"]) == ("Temple University", "Lansdale") and "at" not in c
+
+
+# -- Metro ---------------------------------------------------------------------
+
+
+def metro_feed():
+    return server.feeds.get(next_weekday(2), "metro")
+
+
+def test_resolve_lines():
+    assert metro.resolve_lines("MFL") == ["L1"]
+    assert metro.resolve_lines("the El") == ["L1"]
+    assert metro.resolve_lines("Broad Street Line") == ["B1", "B2", "B3"]
+    assert metro.resolve_lines("route 10") == ["T1"]
+    assert metro.resolve_lines("Route 101") == ["D1"]
+    assert metro.resolve_lines("t3 trolley") == ["T3"]
+    with pytest.raises(ValueError, match="L1 \\(Market-Frankford Line\\)"):
+        metro.resolve_lines("Purple Line")
+
+
+def test_metro_platforms_merge_into_stations():
+    feed = metro_feed()
+    city_hall = feed.resolve_station("City Hall")
+    assert city_hall.name == "15th St/City Hall"
+    assert {"L1", "B1", "B2", "T1", "T5"} <= city_hall.routes
+    assert len(feed.platforms[city_hall.stop_id]) > 1
+    for platform in feed.platforms[city_hall.stop_id]:
+        assert feed.resolve_station(platform) is city_hall
+    assert feed.resolve_station("69th St").routes >= {"L1", "M1", "D1", "D2"}
+    # Platform suffixes don't leak into names, and no-stop rows aren't findable.
+    assert not [s.name for s in feed.stops.values() if s.name.endswith(" - B1")]
+    with pytest.raises(gtfs.StationNotFound, match="No Metro station or stop"):
+        feed.resolve_station("Not a stop")
+
+
+def test_metro_schedule_direct():
+    r = call("metro_schedule", {
+        "from_stop": "15th St", "to_stop": "Frankford Transit Center",
+        "date": next_weekday(2).isoformat(), "depart_after": "08:00", "depart_before": "09:00",
+    })
+    assert len(r["trips"]) >= 6  # every few minutes at rush hour
+    t = r["trips"][0]
+    assert (t["line"], t["toward"], t["board_at"]) == ("L1", "Frankford Transit Center", "15th St/City Hall")
+    assert t["summary"].startswith("L1 (Market-Frankford Line) toward Frankford Transit Center leaves 15th St/City Hall")
+
+
+def test_metro_schedule_line_filter():
+    args = {"from_stop": "15th St", "to_stop": "30th St", "date": next_weekday(2).isoformat(),
+            "depart_after": "08:00", "depart_before": "09:00"}
+    both = {t["line"] for t in call("metro_schedule", args)["trips"]}
+    assert "L1" in both and both & {"T1", "T2", "T3", "T4", "T5"}
+    assert {t["line"] for t in call("metro_schedule", {**args, "line": "subway-surface trolleys"})["trips"]} <= {
+        "T1", "T2", "T3", "T4", "T5"}
+    assert call("metro_schedule", {**args, "line": "Purple"})["error"].startswith("No Metro line matches")
+
+
+def test_metro_schedule_transfer():
+    r = call("metro_schedule", {
+        "from_stop": "Erie", "to_stop": "2nd St", "date": next_weekday(2).isoformat(),
+        "depart_after": "08:00", "depart_before": "09:00",
+    })
+    assert "trips" not in r and r["itineraries"]
+    it = r["itineraries"][0]
+    assert it["transfer_at"] in ("15th St/City Hall", "8th-Market")
+    assert [leg["line"] for leg in it["legs"]][1] == "L1"
+    assert "walk_to" not in it
+
+
+def test_metro_schedule_walking_transfer():
+    # The G1 stops on Girard Av, a block's walk from the L1's Front-Girard station.
+    r = call("metro_schedule", {
+        "from_stop": "Girard Av & Broad St", "to_stop": "Spring Garden", "date": next_weekday(2).isoformat(),
+        "depart_after": "10:00", "depart_before": "11:00",
+    })
+    walks = [it for it in r["itineraries"] if "walk_to" in it]
+    assert walks, r
+    assert walks[0]["walk_to"] == "Front-Girard" and walks[0]["walk_min"] >= 2
+    assert ", walk to Front-Girard (about" in walks[0]["summary"]
+
+
+def test_metro_departures_with_live_delays(monkeypatch):
+    day = next_weekday(2)
+    monkeypatch.setattr(server, "now", lambda: datetime.combine(day, dtime(8, 0), server.TZ))
+    feed = server.feeds.get(day, "metro")
+    late_trips = {t.trip_id for t in feed.trips.values() if t.route_id == "T3"}
+
+    def transit_view(route, now=None):
+        return [{"vehicle": "9050", "trip": tid, "minutes_late": 3, "next_stop_sequence": None}
+                for tid in late_trips] if route == "T3" else []
+
+    monkeypatch.setattr(realtime, "transit_view", transit_view)
+    r = call("metro_departures", {"stop": "30th St", "count": 40})
+    deps = r["departures"]
+    t3 = [d for d in deps if d["line"] == "T3"]
+    assert t3 and all(d["status"] == "3 min late" and d["expected"] for d in t3)
+    assert any(d["line"] == "L1" and d["status"].startswith("scheduled (no live data") for d in deps)
+    assert all(d["status"] == "scheduled" for d in deps if d["line"] in ("T1", "T2"))
+    assert "warning" not in r
+
+
+def test_metro_departures_skip_trips_already_past(monkeypatch):
+    day = next_weekday(2)
+    monkeypatch.setattr(server, "now", lambda: datetime.combine(day, dtime(8, 0), server.TZ))
+    monkeypatch.setattr(realtime, "transit_view", lambda route, now=None: [
+        {"vehicle": "1", "trip": t.trip_id, "minutes_late": 30, "next_stop_sequence": 10_000}
+        for t in server.feeds.get(day, "metro").trips.values() if t.route_id == route
+    ])
+    r = call("metro_departures", {"stop": "30th St", "line": "T3"})
+    assert r["departures"] == []  # every T3 is "30 min late" but past this stop already
+
+
+def test_metro_vehicles():
+    r = call("metro_vehicles", {"line": "Route 10"})
+    (t1,) = r["lines"]
+    assert t1["line"] == "T1" and len(t1["vehicles"]) == 2  # the stale one is dropped
+    v, no_estimate = t1["vehicles"]
+    assert (v["status"], v["toward"], v["seats"]) == ("3 min late", "13th St", "MANY_SEATS_AVAILABLE")
+    assert v["next_stop"] == "63rd St & Lebanon Av"  # stop_id looked up in the schedule
+    assert no_estimate["status"] is None and no_estimate["next_stop"] == "Lancaster Av & 40th St"
+    assert "seats" not in no_estimate
+
+    r = call("metro_vehicles", {"line": "BSL"})
+    assert [line["line"] for line in r["lines"]] == ["B1", "B2", "B3"]
+    assert all("no live positions" in line["note"] for line in r["lines"])
+    assert ("/api/TransitView/index.php", {"route": ["B1"]}) not in mock_septa_api.REQUESTS
+
+
+def test_find_metro_stop():
+    r = call("find_metro_stop", {"query": "40th", "line": "T3"})
+    assert r["stops"] and all("T3 trolley" in s["lines"] for s in r["stops"])
+    r = call("find_metro_stop", {"query": "City Hall"})
+    assert r["stops"][0]["name"] == "15th St/City Hall"
+    assert r["stops"][0]["lines"][:2] == ["L1 (Market-Frankford Line)", "B1 (Broad Street Line local)"]
+
+
+def test_metro_tools_without_metro_feed(monkeypatch):
+    rail_only = server.feeds._path("", "rail")
+    if server.feeds.local_zip:
+        pytest.skip("rail zip not cached separately")
+    monkeypatch.setattr(server, "feeds", gtfs.FeedManager(local_zip=str(rail_only)))
+    r = call("metro_schedule", {"from_stop": "15th St", "to_stop": "2nd St"})
+    assert "no Metro (subway and trolley) schedule" in r["error"]
+    assert call("train_schedule", {"from_station": "Jefferson", "to_station": "Swarthmore",
+                                   "date": next_weekday(5).isoformat()})["trains"]
+
+
+def test_gtfs_subset_keeps_only_metro_routes():
+    def table(*rows):
+        return "\n".join(",".join(r) for r in rows) + "\n"
+
+    src = io.BytesIO()
+    with zipfile.ZipFile(src, "w") as z:
+        z.writestr("routes.txt", table(("route_id", "route_type"), ("T1", "0"), ("42", "3")))
+        z.writestr("trips.txt", table(("route_id", "service_id", "trip_id"), ("T1", "s", "t1"), ("42", "s", "b1")))
+        z.writestr("stop_times.txt", table(
+            ("trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"),
+            ("t1", "08:00:00", "08:00:00", "p1", "1"), ("b1", "08:00:00", "08:00:00", "bus", "1"),
+        ))
+        z.writestr("stops.txt", table(
+            ("stop_id", "stop_name", "parent_station"), ("p1", "A - T1", "st"), ("st", "A", ""), ("bus", "B", ""),
+        ))
+        z.writestr("calendar.txt", "service_id\n")
+    with zipfile.ZipFile(io.BytesIO(gtfs.gtfs_subset(src.getvalue(), gtfs.METRO_ROUTE_TYPES))) as out:
+        def ids(name, col):
+            return [line.split(",")[col] for line in out.read(name).decode().splitlines()[1:]]
+        assert ids("routes.txt", 0) == ["T1"]
+        assert ids("trips.txt", 2) == ["t1"]
+        assert ids("stop_times.txt", 0) == ["t1"]
+        assert ids("stops.txt", 0) == ["p1", "st"]  # the platform's parent station too
+        assert "calendar.txt" in out.namelist()

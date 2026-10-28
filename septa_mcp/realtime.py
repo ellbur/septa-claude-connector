@@ -1,4 +1,5 @@
-"""Thin client for SEPTA's real-time JSON API (https://www3.septa.org/api/).
+"""Thin client for SEPTA's real-time JSON API (https://www3.septa.org/api/): Regional Rail
+boards and train positions, trolley and bus positions (TransitView), and alerts.
 
 The real-time API predates the current GTFS feed and uses its own station names for
 a couple dozen stops; `api_station_name` translates GTFS names to the ones it accepts.
@@ -322,17 +323,30 @@ def train_schedule_live(train: str) -> list[dict]:
 
 
 # The alerts feed files the subway and NHSL under rr_route_* too.
-_NOT_REGIONAL_RAIL = {"rr_route_bsl", "rr_route_bso", "rr_route_mfl", "rr_route_mfo", "rr_route_nhsl"}
+_METRO_RR_ROUTES = {"rr_route_bsl", "rr_route_bso", "rr_route_mfl", "rr_route_mfo", "rr_route_nhsl"}
 
 
-def rail_alerts() -> list[dict]:
+def _alert_mode(route_id: str) -> str | None:
+    if route_id == "generic":
+        return "systemwide"
+    if route_id in _METRO_RR_ROUTES or route_id.startswith("trolley_route"):
+        return "metro"
+    if route_id.startswith("rr_route"):
+        return "regional_rail"
+    if route_id.startswith("bus_route"):
+        return "bus"
+    return None  # the app, paratransit (CCT)
+
+
+def alerts() -> list[dict]:
+    """Current alerts for every mode, each tagged with its mode: regional_rail, metro,
+    bus or systemwide. Rows with no message are left out."""
     data = _get("/Alerts/get_alert_data.php")
     out = []
     for r in data if isinstance(data, list) else []:
         rid = str(r.get("route_id", ""))
-        if not rid.startswith("rr_route") and rid != "generic":
-            continue
-        if rid in _NOT_REGIONAL_RAIL:
+        mode = _alert_mode(rid)
+        if not mode:
             continue
         msgs = {
             "current": _strip_html(r.get("current_message")),
@@ -341,13 +355,86 @@ def rail_alerts() -> list[dict]:
         }
         if not any(msgs.values()):
             continue
+        alert = {
+            "route_id": rid,
+            "route_name": r.get("route_name"),
+            "mode": mode,
+            # last_updated is deliberately dropped: it's the route row's timestamp
+            # (years old for most lines), not when the message was posted.
+            **{k: v for k, v in msgs.items() if v},
+        }
+        if msgs["detour"]:
+            for key, field in (
+                ("detour_reason", "detour_reason"),
+                ("detour_from", "detour_start_location"),
+                ("detour_starts", "detour_start_date_time"),
+                ("detour_ends", "detour_end_date_time"),
+            ):
+                v = _clean(re.sub(r"\s+", " ", str(r.get(field) or "")).strip())
+                if v:
+                    alert[key] = v
+        out.append(alert)
+    return out
+
+
+def rail_alerts() -> list[dict]:
+    return [a for a in alerts() if a["mode"] in ("regional_rail", "systemwide")]
+
+
+# TransitView's "late" when the vehicle has no schedule estimate.
+_NO_ESTIMATE = {998, 999}
+# Vehicles that haven't reported for this long are left out (often parked, still listed).
+STALE_REPORT_MINUTES = 15
+
+
+def transit_view(route: str, now: datetime | None = None) -> list[dict]:
+    """Vehicles on a bus, trolley or NHSL route right now. The subway lines aren't in it.
+
+    trip is the GTFS trip_id the vehicle is running; minutes_late is negative when early
+    and None when SEPTA has no estimate.
+    """
+    now = now or datetime.now(TZ)
+    data = _get("/TransitView/index.php", {"route": route})
+    vehicles = data.get("bus") if isinstance(data, dict) else None
+    out = []
+    for v in vehicles if isinstance(vehicles, list) else []:
+        if not isinstance(v, dict):
+            continue
+        try:
+            reported = datetime.fromtimestamp(int(v.get("timestamp")), TZ)
+        except (TypeError, ValueError):
+            reported = None
+        if reported and now - reported > timedelta(minutes=STALE_REPORT_MINUTES):
+            continue
+        try:
+            late = int(v.get("late"))
+        except (TypeError, ValueError):
+            late = None
+        if late in _NO_ESTIMATE:
+            late = None
+        seats = _clean(v.get("estimated_seat_availability"))
         out.append(
             {
-                "route_id": rid,
-                "route_name": r.get("route_name"),
-                # last_updated is deliberately dropped: it's the route row's timestamp
-                # (years old for most lines), not when the message was posted.
-                **{k: v for k, v in msgs.items() if v},
+                "vehicle": _clean(v.get("label")) or _clean(v.get("VehicleID")),
+                "trip": _clean(v.get("trip")),
+                "direction": _clean(v.get("Direction")),
+                "destination": _clean(v.get("destination")),
+                "minutes_late": late,
+                "next_stop_id": _clean(v.get("next_stop_id")),
+                "next_stop": _clean(v.get("next_stop_name")),
+                "next_stop_sequence": _clean(v.get("next_stop_sequence")),
+                "seats": None if seats == "NOT_AVAILABLE" else seats,
+                "reported_at": reported.strftime("%I:%M %p").lstrip("0") if reported else None,
+                "lat": _clean(v.get("lat")),
+                "lon": _clean(v.get("lng")),
             }
         )
     return out
+
+
+def late_status(minutes_late: int | None) -> str | None:
+    if minutes_late is None:
+        return None
+    if minutes_late == 0:
+        return "on time"
+    return f"{minutes_late} min late" if minutes_late > 0 else f"{-minutes_late} min early"

@@ -1,14 +1,19 @@
-# SEPTA Regional Rail connector for Claude
+# SEPTA Regional Rail and Metro connector for Claude
 
 An MCP server that lets Claude answer questions like:
 
 - "What times do trains leave Jefferson for Swarthmore on Saturday morning?"
 - "When's the next train from 30th Street to Paoli, and is it late?"
 - "Where is train 5305 right now?"
-- "Any problems on the Media/Wawa line today?"
+- "How do I get from Erie to 2nd Street on the subway?"
+- "When's the next T3 trolley from 30th Street, and is it running late?"
+- "Any problems on the Media/Wawa line, the El, or the 42 bus today?"
 
-It combines SEPTA's published **GTFS** timetable (for any date in the current schedule)
-with SEPTA's **real-time API** (live delays, tracks, train positions, alerts).
+It covers Regional Rail and the SEPTA Metro: the subway (L1 Market-Frankford Line, B1/B2
+Broad Street Line, B3 Broad-Ridge Spur), the trolleys (T1–T5, G1, D1, D2) and the M1
+Norristown High Speed Line. It combines SEPTA's published **GTFS** timetables (for any date
+in the current schedule) with SEPTA's **real-time API** (live delays, tracks, train and
+trolley positions, and alerts for every mode, buses included).
 
 ## Tools
 
@@ -18,12 +23,23 @@ with SEPTA's **real-time API** (live delays, tracks, train positions, alerts).
 | `next_trains(from_station, to_station, count)` | Live (NextToArrive) | "Next train" right now, with delay status. Falls back to the timetable if the live API is down. |
 | `station_departures(station, count, direction)` | Live (Arrivals) | A station's departure board: final stops, delays, track numbers. |
 | `train_status(train_number)` | Live (TrainView + RRSchedules) | Where a train is, how late, stop-by-stop estimates. |
-| `rail_alerts(line)` | Live (Alerts) | Service advisories and disruptions. |
 | `find_station(query)` | GTFS | Resolving vague or ambiguous station names. |
+| `metro_schedule(from_stop, to_stop, date, depart_after, depart_before, line)` | GTFS | Subway and trolley timetables for any day, with one-transfer itineraries (including short walks between stations) when there's no direct trip. |
+| `metro_departures(stop, line, count)` | GTFS + live (TransitView) | Next departures from a Metro station or trolley stop, with live delays for trolleys and the M1. |
+| `metro_vehicles(line)` | Live (TransitView) | Where a line's trolleys are, their next stops and how late. |
+| `find_metro_stop(query, line)` | GTFS | Resolving Metro station and trolley stop names. |
+| `service_alerts(line, mode)` | Live (Alerts) | Advisories and detours for Regional Rail, Metro and bus routes. |
+
+The Regional Rail tools and the Metro tools are separate: none plans a trip that mixes the
+two, so Claude plans each part and changes at a shared hub (Suburban ↔ 15th St/City Hall,
+Gray 30th St ↔ Drexel Station at 30th St, Jefferson ↔ 13th St or 8th-Market, Fern Rock and
+Norristown Transit Centers).
 
 Station names are matched loosely: "Jefferson", "Market East", "30th Street", "Temple",
 "Mt Airy" all work. Ambiguous names ("Chestnut Hill", "Airport", "Norristown") return the
-candidates so Claude can ask which one you mean.
+candidates so Claude can ask which one you mean. Metro lines go by their current names or
+the ones riders still use: "MFL" or "the El" is the L1, "BSL" is B1–B3, "Route 10" is the
+T1, "Route 15" the G1, "Route 101" the D1, "NHSL" the M1.
 
 ### Example
 
@@ -35,7 +51,7 @@ When no train reaches the destination (e.g. buses replace trains on the last str
 line), results list the alerts for the line plus `partial_service`: the trains to the
 closest station on the way that trains still reach, where riders change to the shuttle.
 
-## Two SEPTA quirks it handles
+## SEPTA quirks it handles
 
 **Through-routed trains.** Most Regional Rail trains change line name in Center City (a
 Lansdale/Doylestown train becomes a Media/Wawa train at Suburban Station). GTFS models this
@@ -53,6 +69,17 @@ uses older names for about 30 stations ("Temple U", "30th Street Station", "Ft W
 "Wayne Station", Arrivals wants "Wayne"). `realtime.py` translates automatically; the map is
 checked against the live API by `tests/test_live.py`.
 
+**Metro stations are many stops.** The Metro's GTFS (part of SEPTA's bus feed) has a stop
+per platform or direction, and separate ones per line at transfer stations: 15th St/City
+Hall is eight stops across the L1, B1, B2 and the T trolleys. `metro.py` merges them into
+one stop per station, by parent station and by name, so transfers between lines work, and
+links stations within a short walk of each other (Girard Av & Front St on the G1 and
+Front-Girard on the L1) so itineraries can include the walk.
+
+**No live subway data.** SEPTA's real-time JSON API reports trolley and M1 positions and
+delays (TransitView), but nothing for the L1 or the Broad Street Line, so subway departures
+are marked as scheduled times.
+
 ## Run it
 
 Requires Python 3.11+.
@@ -63,8 +90,9 @@ septa-mcp --transport http --port 8000   # Streamable HTTP at http://localhost:8
 septa-mcp                                # stdio, for local MCP clients
 ```
 
-On first start it downloads the rail schedule (≈750 KB) from SEPTA, falling back to
-SEPTA's GitHub releases, and re-checks daily. SEPTA publishes a new feed every few weeks,
+On first start it downloads SEPTA's schedules (≈27 MB) from SEPTA, falling back to SEPTA's
+GitHub releases, and re-checks daily. It keeps the rail feed and the Metro routes cut from
+the bus feed, about 2.3 MB together. SEPTA publishes a new feed every few weeks,
 a few days before it takes effect, and its download link switches to it right away; until the
 new feed starts, the server also keeps the one in effect (from the GitHub releases) and answers
 each date from the feed that covers it. Results include `valid_from`/`valid_until`, and a
@@ -129,7 +157,7 @@ For local use only, point a desktop MCP client at the stdio command instead:
 | Env var | Default | Purpose |
 |---|---|---|
 | `SEPTA_DATA_DIR` | `~/.cache/septa-mcp` | Where the downloaded schedule is cached |
-| `SEPTA_GTFS_ZIP` | — | Use a local `gtfs_public.zip` / `google_rail.zip` instead of downloading |
+| `SEPTA_GTFS_ZIP` | — | Use a local `gtfs_public.zip` instead of downloading (a bare `google_rail.zip` works too, without the Metro tools) |
 | `SEPTA_GTFS_URLS` | SEPTA, then GitHub | Comma-separated download URLs |
 | `SEPTA_API_BASE` | `https://www3.septa.org/api` | Real-time API base (point at the mock for offline dev) |
 | `SEPTA_API_TIMEOUT` | `10` | Seconds per real-time request |
@@ -150,9 +178,12 @@ you can also run it standalone for offline development.
 
 ## Limits
 
-- Regional Rail only. Buses, the Metro (subway/trolley) lines, NJ Transit and Amtrak are
-  not covered. The bus/Metro GTFS is in the same SEPTA download if you want to extend it.
+- Bus schedules aren't covered (only bus alerts), nor are the trackless trolleys (59, 66,
+  75, which run like buses), NJ Transit, PATCO and Amtrak. The bus routes are in the same
+  GTFS download, but at ~3 million stop times they need a database rather than the
+  in-memory approach used here.
+- No trip planning across Regional Rail and the Metro.
 - Transfer itineraries are limited to one transfer; that covers any pair of Regional Rail
-  stations.
+  stations and most Metro trips.
 - SEPTA's real-time API is unofficially documented and its response formats occasionally
   shift; `realtime.py` parses defensively but is the first place to look if a live tool breaks.
