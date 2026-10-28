@@ -114,8 +114,11 @@ septa-mcp                                # stdio, for local MCP clients
 ```
 
 On first start it downloads SEPTA's schedules (≈27 MB) from SEPTA, falling back to SEPTA's
-GitHub releases, and re-checks daily. It keeps the rail feed and the Metro and bus routes
-from the bus feed, about 12 MB together. Processing a new download takes 10–15 seconds. SEPTA publishes a new feed every few weeks,
+GitHub releases. It keeps the rail feed and the Metro and bus routes from the bus feed,
+about 12 MB together; processing a download takes 10–15 seconds. It re-checks weekly, since
+SEPTA announces timetable changes well ahead, and sooner if the cached timetable runs out.
+`septa-mcp --refresh-feeds` downloads the newest feeds into the cache and exits, for running
+on a schedule instead. SEPTA publishes a new feed every few weeks,
 a few days before it takes effect, and its download link switches to it right away; until the
 new feed starts, the server also keeps the one in effect (from the GitHub releases) and answers
 each date from the feed that covers it. Results include `valid_from`/`valid_until`, and a
@@ -145,15 +148,21 @@ traffic fits in Cloud Run's free tier):
 
 ```bash
 gcloud auth login
-PROJECT=my-gcp-project ./deploy.sh    # optional: REGION, SERVICE, BUCKET
+PROJECT=my-gcp-project ./deploy.sh    # optional: REGION, SERVICE, BUCKET, JOB, REFRESH_SCHEDULE
 ```
+
+Besides the service, it creates a Cloud Run job, `septa-mcp-refresh`, that runs
+`septa-mcp --refresh-feeds` against the same bucket, and a Cloud Scheduler job that starts
+it every Saturday at 11:17 PM Philadelphia time. The service picks up the new timetables on
+its next request, so downloading and processing never hold up a rider's question. The
+service only downloads them itself if the job hasn't succeeded in 8 days, or the cached
+timetable has run out. To refresh now: `gcloud run jobs execute septa-mcp-refresh --region us-east4`.
 
 The service gets 1 GiB of memory: with every feed loaded, and the next schedule too in the
 days before it starts, the server uses up to ~350 MB, and processing a download briefly
 adds ~170 MB more.
 
-It mounts a Cloud Storage bucket at `/data` so the schedule survives cold starts and is
-downloaded at most once a day, and caps the service at one instance so the real-time API
+It mounts a Cloud Storage bucket at `/data` so the schedule survives cold starts, and caps the service at one instance so the real-time API
 cache and rate limit (10 s, 60 requests/minute by default) apply to the whole service.
 When the limit is hit, tools fall back to the published schedule or report the error.
 
@@ -186,6 +195,7 @@ For local use only, point a desktop MCP client at the stdio command instead:
 | `SEPTA_DATA_DIR` | `~/.cache/septa-mcp` | Where the downloaded schedule is cached |
 | `SEPTA_GTFS_ZIP` | — | Use a local `gtfs_public.zip` instead of downloading (a bare `google_rail.zip` works too, without the Metro tools) |
 | `SEPTA_GTFS_URLS` | SEPTA, then GitHub | Comma-separated download URLs |
+| `SEPTA_GTFS_MAX_AGE_HOURS` | `168` (a week) | Re-download the timetables when the cache is older than this |
 | `SEPTA_API_BASE` | `https://www3.septa.org/api` | Real-time API base (point at the mock for offline dev) |
 | `SEPTA_API_TIMEOUT` | `10` | Seconds per real-time request |
 | `SEPTA_API_CACHE_SECONDS` | `10` | How long identical real-time requests share a response |

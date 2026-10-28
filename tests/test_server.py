@@ -818,3 +818,73 @@ def test_transit_view_all():
     by_route = realtime.transit_view_all()
     assert set(by_route) == {"42", "T1"}
     assert len(by_route["T1"]) == 2  # the stale one is dropped here too
+
+
+# -- Timetable refreshes ---------------------------------------------------------
+
+
+@pytest.fixture
+def fresh_manager(tmp_path, monkeypatch):
+    """A FeedManager on an empty cache whose downloads (counted) return today's rail feed."""
+    if server.feeds.local_zip:
+        pytest.skip("needs the downloaded rail feed")
+    rail = server.feeds._path("", "rail").read_bytes()
+    downloads = []
+
+    def download(self, urls):
+        downloads.append(urls)
+        return rail, "https://example.test/gtfs_public.zip"
+
+    monkeypatch.setattr(gtfs.FeedManager, "_download", download)
+    monkeypatch.delenv("SEPTA_GTFS_MAX_AGE_HOURS", raising=False)
+    start, _ = gtfs.RailFeed(rail).feed_range()
+    monkeypatch.setattr(gtfs, "_today", lambda: start)  # no "in effect" feed needed
+    return gtfs.FeedManager(data_dir=tmp_path), downloads, tmp_path
+
+
+def _age(path, days):
+    t = path.stat().st_mtime - days * 86400
+    os.utime(path, (t, t))
+
+
+def test_timetable_refreshes_weekly(fresh_manager):
+    fm, downloads, data = fresh_manager
+    assert fm.max_age == 7 * 86400
+    fm.get()
+    assert len(downloads) == 1
+    _age(data / "google_rail.zip", 6)
+    fm.get()
+    assert len(downloads) == 1  # six days old: still good
+    _age(data / "google_rail.zip", 2)
+    fm._last_attempt.clear()
+    fm.get()
+    assert len(downloads) == 2  # eight days old: re-downloaded
+
+
+def test_refresh_feeds_downloads_now(fresh_manager, monkeypatch):
+    fm, downloads, data = fresh_manager
+    fm.get()
+    fm.refresh()  # fresh cache, but the scheduled job always downloads
+    assert len(downloads) == 2
+    monkeypatch.setattr(gtfs.FeedManager, "_download", lambda self, urls: (_ for _ in ()).throw(OSError("down")))
+    with pytest.raises(OSError):
+        fm.refresh()  # the job must fail loudly, not keep the old feed quietly
+
+
+def test_expired_timetable_refreshes_before_a_week(fresh_manager, monkeypatch):
+    fm, downloads, data = fresh_manager
+    _, end = fm.get().feed_range()
+    monkeypatch.setattr(gtfs, "_today", lambda: end + timedelta(days=1))
+    fm._last_attempt.clear()  # it's been more than 15 minutes
+    fm.get()
+    assert len(downloads) == 2  # a day old, but past the timetable's end
+    fm.get()
+    assert len(downloads) == 2  # still past it (same feed came back): not again right away
+
+
+def test_refresh_feeds_cli(monkeypatch):
+    calls = []
+    monkeypatch.setattr(server.feeds, "refresh", lambda: calls.append("refresh"))
+    monkeypatch.setattr(sys, "argv", ["septa-mcp", "--refresh-feeds"])
+    server.main()  # returns instead of serving
+    assert calls == ["refresh"]

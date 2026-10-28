@@ -17,6 +17,7 @@ from . import bus, metro, realtime
 from .gtfs import (
     TZ,
     AmbiguousStation,
+    FEED_NAMES,
     FeedManager,
     FeedUnavailable,
     StationNotFound,
@@ -1259,8 +1260,22 @@ def main() -> None:
     p.add_argument("--transport", choices=["stdio", "http"], default=os.environ.get("MCP_TRANSPORT", "stdio"))
     p.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
     p.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
+    p.add_argument(
+        "--refresh-feeds",
+        action="store_true",
+        help="Download SEPTA's newest timetables into the cache and exit (for a scheduled job)",
+    )
     args = p.parse_args()
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+
+    if args.refresh_feeds:
+        feeds.refresh()
+        for kind in FEED_NAMES:
+            try:
+                log.info("SEPTA %s schedule: %s", kind, feeds.get(kind=kind).summary()["feed_version"])
+            except FeedUnavailable as e:
+                log.warning("%s", e)
+        return
 
     # Load (and if needed download) the timetable up front so the first question is fast.
     log.info("Loaded SEPTA rail schedule: %s", feeds.get().summary())

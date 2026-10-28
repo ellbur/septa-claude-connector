@@ -286,7 +286,7 @@ class ServiceCalendar:
             ),
         }
         if self.source.startswith("http"):
-            out["note"] += " The server checks SEPTA for newer feeds daily."
+            out["note"] += " The server checks SEPTA for newer feeds weekly."
         return out
 
     def services_on(self, d: date) -> set[str]:
@@ -914,11 +914,15 @@ class FeedManager:
         self,
         data_dir: str | os.PathLike | None = None,
         urls: list[str] | None = None,
-        max_age_hours: float = 24.0,
+        max_age_hours: float | None = None,
         local_zip: str | None = None,
     ):
         self.data_dir = Path(data_dir or os.environ.get("SEPTA_DATA_DIR") or Path.home() / ".cache" / "septa-mcp")
         self.urls = urls or [u for u in os.environ.get("SEPTA_GTFS_URLS", "").split(",") if u] or DEFAULT_GTFS_URLS
+        # SEPTA announces timetable changes well ahead, so a weekly check is plenty; on Cloud
+        # Run a scheduled job (refresh(), via `septa-mcp --refresh-feeds`) does it instead.
+        if max_age_hours is None:
+            max_age_hours = float(os.environ.get("SEPTA_GTFS_MAX_AGE_HOURS", 7 * 24))
         self.max_age = max_age_hours * 3600
         self.local_zip = local_zip or os.environ.get("SEPTA_GTFS_ZIP")
         self._feeds: dict[tuple[str, str], RailFeed] = {}  # (slot, kind) -> parsed feed
@@ -964,17 +968,20 @@ class FeedManager:
             raise RuntimeError("No SEPTA GTFS release found that has started yet")
         return [RELEASE_ZIP.format(tag=max(started)[2])]
 
-    def _refresh(self, slot: str, urls) -> None:
-        """Re-download slot's feeds from urls() when older than max_age, or when cached in
-        an older CACHE_FORMAT (before the Metro or bus feeds were)."""
+    def _refresh(self, slot: str, urls, force: bool = False, raise_errors: bool = False) -> bool:
+        """Re-download slot's feeds from urls() when older than max_age, when cached in an
+        older CACHE_FORMAT (before the Metro or bus feeds were), or when forced. Returns
+        whether it downloaded. Failures are logged, and the cached feeds kept, unless
+        raise_errors or there's no cached feed."""
         rail = self._path(slot, "rail")
         now = time.time()
         stale = (
-            now - (rail.stat().st_mtime if rail.exists() else 0) > self.max_age
+            force
+            or now - (rail.stat().st_mtime if rail.exists() else 0) > self.max_age
             or (self._meta(slot) or {}).get("format") != CACHE_FORMAT
         )
-        if not stale or now - self._last_attempt.get(slot, 0) <= 900:  # don't hammer on failures
-            return
+        if not stale or (not raise_errors and now - self._last_attempt.get(slot, 0) <= 900):  # don't hammer
+            return False
         self._last_attempt[slot] = now
         try:
             blob, url = self._download(urls())
@@ -991,10 +998,23 @@ class FeedManager:
             (self.data_dir / f"source{slot}.json").write_text(
                 json.dumps({"source": url, "kinds": sorted(feeds), "format": CACHE_FORMAT})
             )
+            log.info("Downloaded SEPTA GTFS (%s) from %s", ", ".join(sorted(feeds)), url)
+            return True
         except Exception:
-            if not rail.exists():
+            if raise_errors or not rail.exists():
                 raise
             log.exception("Refresh of the%s feed failed; using cached feed", slot.replace("_", " "))
+            return False
+
+    def refresh(self) -> None:
+        """Download the newest feeds now, whatever the cache's age, plus the ones in effect
+        today if the newest haven't started: for a scheduled job. Raises if a download fails."""
+        with self._lock:
+            self._refresh("", lambda: self.urls, force=True, raise_errors=True)
+            start, _ = self._load("", "rail").feed_range()
+            today = _today()
+            if start and start > today:
+                self._refresh("_in_effect", lambda: self._in_effect_urls(today), force=True, raise_errors=True)
 
     def _load(self, slot: str, kind: str) -> RailFeed | None:
         """The parsed feed cached for (slot, kind), re-parsed when the file is newer."""
@@ -1026,6 +1046,12 @@ class FeedManager:
             today = _today()
             self._refresh("", lambda: self.urls)
             latest = self._load("", kind)
+            if latest is not None:
+                # Past the cached timetable's last day (the weekly refresh missed a new one):
+                # don't wait for the cache to age out.
+                _, end = latest.feed_range()
+                if end and end < today and self._refresh("", lambda: self.urls, force=True):
+                    latest = self._load("", kind)
             if latest is None:
                 if not self._path("", "rail").exists():
                     raise RuntimeError("SEPTA GTFS download failed recently; retrying later")
