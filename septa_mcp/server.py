@@ -1493,7 +1493,12 @@ async def transit_in_area(place: str, modes: list[Mode] | None = None) -> dict:
 
     index = await anyio.to_thread.run_sync(_stop_index)
     inside = index.inside(test, modes)
+    # A station named for the place but just over its line (Media station is outside Media
+    # borough) is still what a rider means by it.
+    named = [s for s in index.named(p.name, [m for m in ("regional_rail", "metro") if not modes or m in modes])
+             if s not in inside and places.meters(p.lat, p.lon, s.lat, s.lon) <= 2000]
     rail = [s.to_dict() for s in inside if s.mode == "regional_rail"]
+    rail += [{**s.to_dict(), "just_outside": True} for s in named if s.mode == "regional_rail"]
     metro_stops = [s for s in inside if s.mode == "metro"]
     bus_counts: dict[str, int] = defaultdict(int)
     for s in inside:
@@ -1508,6 +1513,8 @@ async def transit_in_area(place: str, modes: list[Mode] | None = None) -> dict:
             return all(metro.line_info(line).mode == "trolley" for line in s.lines)
 
         result["metro_stations"] = [s.to_dict() for s in metro_stops if not trolley_only(s)]
+        result["metro_stations"] += [{**s.to_dict(), "just_outside": True} for s in named
+                                     if s.mode == "metro" and not trolley_only(s)]
         trolley_stops = [s for s in metro_stops if trolley_only(s)]
         trolley: dict[str, int] = defaultdict(int)
         for s in trolley_stops:
@@ -1521,6 +1528,8 @@ async def transit_in_area(place: str, modes: list[Mode] | None = None) -> dict:
         result["bus_routes"] = [
             {"route": r, "stops_in_area": n} for r, n in sorted(bus_counts.items(), key=lambda x: (-x[1], len(x[0]), x[0]))
         ]
+    if named:
+        result["just_outside"] = "Stations marked just_outside are named for it but are just beyond its boundary."
     if not inside:
         result["note"] = "No stops inside. Try stops_near with its coordinates and a bigger radius."
     else:
