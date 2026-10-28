@@ -401,8 +401,9 @@ async def _live_partial_service(feed, origin, dest, count: int, have_alerts: boo
     try:
         live = await anyio.to_thread.run_sync(realtime.next_to_arrive, origin.name, end.name, count)
         out["trains"] = [_with_destination(feed, t) for t in live]
-    except realtime.SeptaAPIError:
+    except realtime.SeptaAPIError as e:
         live = []
+        out["live_error"] = str(e)
     if not live:
         out["trains"] = [ride_to_dict(feed, r, current.date()) for r in rides[:count]]
         out["source"] = "published schedule"

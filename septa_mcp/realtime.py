@@ -11,6 +11,8 @@ import html
 import json
 import os
 import re
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,6 +23,11 @@ from zoneinfo import ZoneInfo
 BASE_URL = os.environ.get("SEPTA_API_BASE", "https://www3.septa.org/api")
 USER_AGENT = "septa-mcp/0.1"
 TIMEOUT = float(os.environ.get("SEPTA_API_TIMEOUT", "10"))
+# Identical requests within CACHE_SECONDS share one response, and at most MAX_PER_MINUTE
+# requests go to SEPTA in any 60-second window. Both are per process; deploy with a
+# single instance so the limit holds for the whole app.
+CACHE_SECONDS = float(os.environ.get("SEPTA_API_CACHE_SECONDS", "10"))
+MAX_PER_MINUTE = int(os.environ.get("SEPTA_API_MAX_PER_MINUTE", "60"))
 TZ = ZoneInfo("America/New_York")
 
 # GTFS stop_name -> name the real-time API expects (only where they differ).
@@ -74,11 +81,61 @@ class SeptaAPIError(RuntimeError):
     pass
 
 
+_cache: dict[str, tuple[float, Any]] = {}  # url -> (expires, data)
+_url_locks: dict[str, threading.Lock] = {}
+_sent: list[float] = []  # times of requests sent in the last minute
+_lock = threading.Lock()
+
+
+def clear_cache() -> None:
+    with _lock:
+        _cache.clear()
+        _sent.clear()
+
+
+def _take_slot(now: float) -> float:
+    """Reserve a request slot. Returns 0 if one was free, else seconds until one frees up."""
+    with _lock:
+        while _sent and _sent[0] <= now - 60:
+            _sent.pop(0)
+        if len(_sent) >= MAX_PER_MINUTE:
+            return _sent[0] + 60 - now
+        _sent.append(now)
+        return 0
+
+
 def _get(path: str, params: dict[str, Any] | None = None) -> Any:
     q = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
     url = f"{BASE_URL}{path}"
     if q:
         url += "?" + urllib.parse.urlencode(q)
+    with _lock:
+        url_lock = _url_locks.setdefault(url, threading.Lock())
+    # One request per URL at a time, so concurrent callers wait for the first one's answer.
+    with url_lock:
+        now = time.monotonic()
+        with _lock:
+            hit = _cache.get(url)
+        if hit and hit[0] > now:
+            return hit[1]
+        wait = _take_slot(now)
+        if wait:
+            raise SeptaAPIError(
+                f"Live SEPTA data is paused: this server's limit of {MAX_PER_MINUTE} requests per minute "
+                f"to SEPTA, shared by all its users, was reached. Try again in about {max(1, round(wait))} seconds."
+            )
+        data = _fetch(url)
+        with _lock:
+            if len(_cache) > 500:
+                for k in [k for k, (exp, _) in _cache.items() if exp <= now]:
+                    del _cache[k]
+                    if not _url_locks[k].locked():
+                        del _url_locks[k]
+            _cache[url] = (now + CACHE_SECONDS, data)
+        return data
+
+
+def _fetch(url: str) -> Any:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:

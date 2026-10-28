@@ -31,6 +31,11 @@ from septa_mcp.server import parse_clock, parse_date  # noqa: E402
 realtime.BASE_URL = os.environ["SEPTA_API_BASE"]
 
 
+@pytest.fixture(autouse=True)
+def _fresh_api_cache():
+    realtime.clear_cache()
+
+
 def call(tool: str, args: dict) -> dict:
     async def go():
         async with Client(server.mcp) as c:
@@ -153,6 +158,30 @@ def test_api_error_message_surfaces():
         realtime._get("/NextToArrive/index.php", {"req1": "Fort Washington", "req2": "Jefferson Station"})
 
 
+def test_api_responses_cached_briefly(monkeypatch):
+    before = len(mock_septa_api.REQUESTS)
+    realtime.train_view()
+    realtime.train_view()
+    assert len(mock_septa_api.REQUESTS) == before + 1
+    monkeypatch.setattr(realtime, "CACHE_SECONDS", 0)
+    realtime.clear_cache()
+    realtime.train_view()
+    realtime.train_view()
+    assert len(mock_septa_api.REQUESTS) == before + 3
+
+
+def test_api_rate_limit(monkeypatch):
+    monkeypatch.setattr(realtime, "MAX_PER_MINUTE", 2)
+    realtime.train_view()
+    realtime.rail_alerts()
+    realtime.train_view()  # cached, doesn't count
+    with pytest.raises(realtime.SeptaAPIError, match=r"limit of 2 requests per minute.*shared by all its users"):
+        realtime.train_schedule_live("5305")
+    # Tools still answer from the timetable when the live API is throttled.
+    r = call("next_trains", {"from_station": "Jefferson", "to_station": "Swarthmore"})
+    assert r["source"] == "published schedule (live data unavailable)" and "limit of 2" in r["live_error"], r
+
+
 def test_station_departures():
     r = call("station_departures", {"station": "Jefferson"})
     assert r["southbound"][0]["train"] == "5317"
@@ -249,6 +278,16 @@ def test_partial_service_live(monkeypatch):
     assert r["partial_service"]["rail_service_ends_at"] == "Claymont Transit Center"
     assert r["partial_service"]["trains"][0]["train"] == "5317"  # from the live API (mock)
     assert "shuttle bus from Claymont Transit Center" in r["note"]
+
+
+def test_partial_service_reports_rate_limit(monkeypatch):
+    _cut_off_before(monkeypatch, "Wilmington")
+    monkeypatch.setattr(server, "now", lambda: datetime.combine(next_weekday(0), dtime(12, 0), server.TZ))
+    monkeypatch.setattr(realtime, "MAX_PER_MINUTE", 2)  # next_trains + alerts use both
+    r = call("next_trains", {"from_station": "Suburban", "to_station": "Wilmington"})
+    p = r["partial_service"]
+    assert p["source"] == "published schedule" and p["trains"]
+    assert "limit of 2 requests per minute" in p["live_error"]
 
 
 def test_no_partial_service_without_a_through_route():

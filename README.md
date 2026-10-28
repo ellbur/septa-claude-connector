@@ -86,8 +86,21 @@ from `/mcp`.
 ### Add it to Claude as a custom connector
 
 Claude's custom connectors need a public HTTPS URL, so deploy the server somewhere first.
-The included Dockerfile works on any container host (Fly.io, Render, Railway, Cloud Run, a VPS
-behind Caddy, etc.):
+`deploy.sh` puts it on Google Cloud Run, which scales to zero when nobody's using it (low
+traffic fits in Cloud Run's free tier):
+
+```bash
+gcloud auth login
+PROJECT=my-gcp-project ./deploy.sh    # optional: REGION, SERVICE, BUCKET
+```
+
+It mounts a Cloud Storage bucket at `/data` so the schedule survives cold starts and is
+downloaded at most once a day, and caps the service at one instance so the real-time API
+cache and rate limit (10 s, 60 requests/minute by default) apply to the whole service.
+When the limit is hit, tools fall back to the published schedule or report the error.
+
+The included Dockerfile also works on any other container host (Fly.io, Render, Railway, a
+VPS behind Caddy, etc.); run a single instance with a persistent `/data`:
 
 ```bash
 docker build -t septa-mcp .
@@ -117,6 +130,8 @@ For local use only, point a desktop MCP client at the stdio command instead:
 | `SEPTA_GTFS_URLS` | SEPTA, then GitHub | Comma-separated download URLs |
 | `SEPTA_API_BASE` | `https://www3.septa.org/api` | Real-time API base (point at the mock for offline dev) |
 | `SEPTA_API_TIMEOUT` | `10` | Seconds per real-time request |
+| `SEPTA_API_CACHE_SECONDS` | `10` | How long identical real-time requests share a response |
+| `SEPTA_API_MAX_PER_MINUTE` | `60` | Most real-time requests sent to SEPTA in any 60 seconds (per process) |
 | `MCP_TRANSPORT`, `HOST`, `PORT` | `stdio`, `0.0.0.0`, `8000` | Server transport settings |
 
 ## Tests
