@@ -393,9 +393,25 @@ def transit_view(route: str, now: datetime | None = None) -> list[dict]:
     trip is the GTFS trip_id the vehicle is running; minutes_late is negative when early
     and None when SEPTA has no estimate.
     """
-    now = now or datetime.now(TZ)
     data = _get("/TransitView/index.php", {"route": route})
     vehicles = data.get("bus") if isinstance(data, dict) else None
+    return _vehicles(vehicles, now or datetime.now(TZ))
+
+
+def transit_view_all(now: datetime | None = None) -> dict[str, list[dict]]:
+    """Every bus, trolley and NHSL vehicle right now, by route, in one request (~300 KB):
+    cheaper than transit_view per route at stops many routes serve."""
+    data = _get("/TransitViewAll/index.php")
+    groups = data.get("routes") if isinstance(data, dict) else None
+    now = now or datetime.now(TZ)
+    out: dict[str, list[dict]] = {}
+    for group in groups if isinstance(groups, list) else []:
+        for route, vehicles in (group.items() if isinstance(group, dict) else []):
+            out.setdefault(str(route), []).extend(_vehicles(vehicles, now))
+    return out
+
+
+def _vehicles(vehicles: Any, now: datetime) -> list[dict]:
     out = []
     for v in vehicles if isinstance(vehicles, list) else []:
         if not isinstance(v, dict):

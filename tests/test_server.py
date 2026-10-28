@@ -26,7 +26,7 @@ os.environ["SEPTA_API_BASE"] = f"http://127.0.0.1:{_mock.server_port}/api"
 
 from mcp import Client  # noqa: E402
 
-from septa_mcp import gtfs, metro, realtime, server  # noqa: E402
+from septa_mcp import bus, gtfs, metro, realtime, server  # noqa: E402
 from septa_mcp.server import parse_clock, parse_date  # noqa: E402
 
 # In case realtime was imported (e.g. by test_live.py) before the env var was set.
@@ -666,3 +666,155 @@ def test_frequency_summary():
     even = metro.frequency(metro.LINES["L1"], "Frankford", [t0, t0 + timedelta(minutes=6)], t0)
     assert even["summary"].endswith("runs about every 6 min around 8:00 AM.")
     assert metro.frequency(metro.LINES["L1"], "Frankford", [t0], t0) is None
+
+
+# -- Buses ---------------------------------------------------------------------
+
+
+def bus_feed():
+    return server.feeds.get(next_weekday(2), "bus")
+
+
+def _gtfs_zip(**tables) -> bytes:
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as z:
+        for name, rows in tables.items():
+            z.writestr(f"{name}.txt", "\n".join(",".join(r) for r in rows) + "\n")
+    return out.getvalue()
+
+
+def _tiny_bus_gtfs(stop_times=None) -> bytes:
+    """Route 1 runs along Broad St, past Walnut (both sides) to Spruce; route T1 is a trolley."""
+    return _gtfs_zip(
+        routes=[("route_id", "route_short_name", "route_long_name", "route_type"),
+                ("1", "1", "Broad", "3"), ("T1", "T1", "Trolley", "0")],
+        trips=[("route_id", "service_id", "trip_id", "trip_headsign", "direction_id"),
+               ("1", "wk", "a", "Spruce", "0"), ("T1", "wk", "t", "X", "0"), ("1", "wk", "b", "Walnut", "1")],
+        stop_times=stop_times or [
+            ("trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence", "pickup_type", "drop_off_type"),
+            ("a", "08:00:00", "08:00:00", "1", "1", "0", "0"),
+            ("a", "08:05:00", "08:05:00", "2", "2", "0", "0"),
+            ("a", "08:09:00", "08:09:00", "4", "3", "0", "1"),
+            ("t", "08:00:00", "08:00:00", "9", "1", "0", "0"),
+            ("b", "09:00:00", "09:00:00", "4", "1", "0", "0"),
+            ("b", "09:04:00", "09:04:00", "3", "2", "0", "0"),
+        ],
+        stops=[("stop_id", "stop_name", "stop_lat", "stop_lon"),
+               ("1", "Broad St & Arch St", "39.9550", "-75.1630"),
+               ("2", "Broad St & Walnut St", "39.9490", "-75.1640"),
+               ("3", "Walnut St & Broad St - FS", "39.9492", "-75.1642"),
+               ("4", "Broad St & Spruce St", "39.9470", "-75.1650"),
+               ("9", "Trolley Stop", "39.9", "-75.2")],
+        calendar=[("service_id", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+                   "start_date", "end_date"), ("wk", "1", "1", "1", "1", "1", "0", "0", "20261101", "20261130")],
+    )
+
+
+def test_bus_build_and_corners():
+    feed = bus.BusFeed(bus.build(_tiny_bus_gtfs()))
+    assert set(feed.routes) == {"1"} and [t.trip_id for t in feed.trips] == ["a", "b"]  # no trolley
+    # Both stops at Broad & Walnut, named either way round, one with a side suffix: one corner.
+    corner = feed.resolve_stop("walnut and broad")
+    assert corner.name == "Broad St & Walnut St" and len(corner.stops) == 2
+    assert feed.resolve_stop("stop 3") is corner and feed.resolve_stop("#2") is corner
+    day = date(2026, 11, 4)
+    start, end = datetime.combine(day, dtime(0, 0), server.TZ), datetime.combine(day, dtime(23, 0), server.TZ)
+    (ride,) = feed.rides(feed.resolve_stop("Broad & Arch"), corner, start, end)
+    d = bus.ride_to_dict(feed, ride, day)
+    assert (d["depart"], d["arrive"], d["board_stop_id"], d["toward"], d["stops"]) == ("8:00 AM", "8:05 AM", "1", "Spruce", 0)
+    # No getting off where drop-off isn't allowed, and no departures from a trip's last stop.
+    assert feed.rides(feed.resolve_stop("Broad & Arch"), feed.resolve_stop("Spruce"), start, end) == []
+    assert [feed.trips[ti].trip_id for _, ti, _ in feed.departures(feed.resolve_stop("Spruce"), start, end)] == ["b"]
+    assert [feed.trips[ti].trip_id for _, ti, _ in feed.departures(corner, start, end)] == ["a"]  # b ends there
+
+
+def test_bus_build_needs_stop_times_grouped_by_trip():
+    header = ("trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence")
+    rows = [header, ("a", "08:00:00", "08:00:00", "1", "1"), ("b", "09:00:00", "09:00:00", "4", "1"),
+            ("a", "08:05:00", "08:05:00", "2", "2")]
+    with pytest.raises(ValueError, match="together"):
+        bus.build(_tiny_bus_gtfs(rows))
+
+
+def test_bus_stops_by_corner_and_number():
+    feed = bus_feed()
+    corner = feed.resolve_stop("Broad and Walnut")
+    assert feed.resolve_stop("Walnut St & Broad St") is corner
+    assert corner.name == "Broad St & Walnut St" and "42" in corner.routes
+    market = feed.resolve_stop("stop 10266")
+    assert market.name == "15th St & Market St" and {"17", "33"} <= market.routes
+    with pytest.raises(gtfs.AmbiguousStation) as e:
+        feed.resolve_stop("Main St & 3rd Av")  # in more than one town
+    assert len(set(e.value.candidates)) == len(e.value.candidates) > 1
+    with pytest.raises(gtfs.StationNotFound, match="No bus stop matches"):
+        feed.resolve_stop("Nowhere Blvd & Imaginary Ln")
+
+
+def test_bus_routes():
+    feed = bus_feed()
+    assert feed.resolve_routes("42") == ["42"]
+    assert feed.resolve_routes("route 42") == ["42"] == feed.resolve_routes("the 42 bus")
+    assert feed.resolve_routes("K") == ["K"]
+    assert feed.route_label("59") == "Route 59 (trackless trolley)"
+    with pytest.raises(ValueError, match="No bus route matches"):
+        feed.resolve_routes("999")
+
+
+def _route_42_stops(feed, day):
+    """Two stops a weekday route 42 trip serves in order, by stop number."""
+    active = feed.services_on(day)
+    ti = next(i for i, t in enumerate(feed.trips) if t.route_id == "42" and t.service_id in active)
+    first = feed.trip_first[ti]
+    return [feed.stop_rows[feed.st_stop[first + k]]["stop_id"] for k in (3, 15)]
+
+
+def test_bus_schedule_direct():
+    day = next_weekday(2)
+    a, b = _route_42_stops(bus_feed(), day)
+    r = call("bus_schedule", {"from_stop": f"stop {a}", "to_stop": f"stop {b}", "date": day.isoformat(),
+                              "route": "42", "max_results": 50})
+    assert r["trips"] and all(t["route"] == "42" for t in r["trips"])
+    assert any(t["board_stop_id"] == a for t in r["trips"])
+    t = r["trips"][0]
+    assert t["summary"].startswith(f"Route 42 toward {t['toward']} leaves {t['board_at']} at {t['depart']}")
+    assert t["duration_min"] > 0 and t["stops"] >= 1
+
+
+def test_bus_schedule_without_a_direct_bus():
+    r = call("bus_schedule", {"from_stop": "Germantown and Chelten", "to_stop": "Broad and Erie",
+                              "date": next_weekday(2).isoformat(), "depart_after": "08:00", "depart_before": "09:00"})
+    assert r["trips"] == [] and "needs a change" in r["note"]
+    assert "K" in r["routes_at_origin"].split(", ") and r["routes_at_destination"]
+
+
+def test_bus_departures_with_live_delays(monkeypatch):
+    day = next_weekday(2)
+    monkeypatch.setattr(server, "now", lambda: datetime.combine(day, dtime(8, 0), server.TZ))
+    feed = bus_feed()
+    corner = feed.resolve_stop("stop 10266")
+    soon = feed.departures(corner, server.now(), server.now() + timedelta(minutes=30))
+    late_trip = feed.trips[soon[0][1]]
+    monkeypatch.setattr(realtime, "transit_view_all", lambda now=None: {late_trip.route_id: [
+        {"vehicle": "3001", "trip": late_trip.trip_id, "minutes_late": 4, "next_stop_sequence": None}]})
+    r = call("bus_departures", {"stop": "15th and Market", "count": 8})
+    assert r["stop"] == "15th St & Market St"
+    live = [d for d in r["departures"] if d.get("vehicle") == "3001"]
+    assert live and live[0]["status"] == "4 min late" and live[0]["expected"]
+    assert all(d["status"] == "scheduled" for d in r["departures"] if d.get("vehicle") != "3001")
+    assert all(d["board_stop_id"] and d["toward"] for d in r["departures"])
+    r = call("bus_departures", {"stop": "15th and Market", "route": "17", "count": 3})
+    assert [d["route"] for d in r["departures"]] == ["17", "17", "17"]
+
+
+def test_bus_vehicles():
+    r = call("bus_vehicles", {"route": "route 42"})
+    (v,) = r["vehicles"]
+    assert r["route"] == "Route 42"
+    assert (v["status"], v["toward"], v["next_stop"]) == ("6 min late", "Wycombe", "Market St & 15th St")
+    assert call("bus_vehicles", {"route": "999"})["error"].startswith("No bus route matches")
+
+
+def test_transit_view_all():
+    by_route = realtime.transit_view_all()
+    assert set(by_route) == {"42", "T1"}
+    assert len(by_route["T1"]) == 2  # the stale one is dropped here too

@@ -1,4 +1,4 @@
-"""MCP server exposing SEPTA Regional Rail and Metro schedules and real-time status as tools."""
+"""MCP server exposing SEPTA Regional Rail, Metro and bus schedules and real-time status as tools."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import anyio
 from mcp.server.mcpserver import MCPServer
 from mcp_types import ToolAnnotations
 
-from . import metro, realtime
+from . import bus, metro, realtime
 from .gtfs import (
     TZ,
     AmbiguousStation,
@@ -29,13 +29,14 @@ from .gtfs import (
 log = logging.getLogger("septa_mcp")
 
 INSTRUCTIONS = """\
-SEPTA (Philadelphia) schedules and live status for Regional Rail (commuter trains) and the
-Metro: the subway (L1 Market-Frankford Line, B1/B2 Broad Street Line, B3 Broad-Ridge
-Spur), the trolleys (T1-T5, G1, D1, D2) and the M1 Norristown High Speed Line.
+SEPTA (Philadelphia) schedules and live status for Regional Rail (commuter trains), the
+Metro (the subway: L1 Market-Frankford Line, B1/B2 Broad Street Line, B3 Broad-Ridge Spur;
+the trolleys T1-T5, G1, D1, D2; and the M1 Norristown High Speed Line) and buses.
 
 - Regional Rail tools: train_schedule, next_trains, station_departures, train_status,
   find_station. Metro tools: metro_schedule, metro_departures, metro_vehicles,
-  find_metro_stop. service_alerts covers every mode, buses included.
+  find_metro_stop. Bus tools: bus_schedule, bus_departures, bus_vehicles, find_bus_stop.
+  service_alerts covers every mode.
 - Regional Rail trains are identified by number and final_stop (where the train ends),
   which is how station boards list them. A train's final_stop can be past the rider's stop
   or on another line's branch; that's normal, not a sign of the wrong train. depart and
@@ -59,14 +60,18 @@ Spur), the trolleys (T1-T5, G1, D1, D2) and the M1 Norristown High Speed Line.
   Suburban Station <-> 15th St/City Hall, Gray 30th St Station <-> Drexel Station at
   30th St, Jefferson Station <-> 13th St or 8th-Market (short walks), Fern Rock and
   Norristown Transit Centers.
-All times are America/New_York local time. Not covered: bus schedules (only bus alerts),
-NJ Transit, PATCO and Amtrak.
+- Bus stops are corners, named by cross streets in either order, or by the stop number
+  on the sign. Results name the corner (board_at) and the stop there the bus leaves from
+  (board_stop: which side of the street, and board_stop_id, its number); tell riders
+  which side when it matters. bus_schedule only finds buses that go directly; for a trip
+  that needs a change, plan the legs separately via a corner both routes serve.
+All times are America/New_York local time. Not covered: NJ Transit, PATCO and Amtrak.
 """
 
 mcp = MCPServer(
     name="septa",
-    title="SEPTA Regional Rail and Metro",
-    description="SEPTA Regional Rail and Metro (subway, trolley) schedules (GTFS) and real-time status.",
+    title="SEPTA Regional Rail, Metro and bus",
+    description="SEPTA Regional Rail, Metro (subway, trolley) and bus schedules (GTFS) and real-time status.",
     instructions=INSTRUCTIONS,
     version="0.1.0",
 )
@@ -1018,12 +1023,239 @@ def _vehicle(feed, v: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Buses
+# ---------------------------------------------------------------------------
+
+
+def _bus_feed(day: date | None = None):
+    return feeds.get(day, "bus")
+
+
+def _bus_routes(feed, route: str | None) -> set[str] | None:
+    return set(feed.resolve_routes(route)) if route else None
+
+
+def _bus_alerts(feed, routes: set[str]) -> dict:
+    """Current alerts (mostly detours) for these bus routes, to explain an empty result."""
+    names = {(feed.routes.get(r, {}).get("route_short_name") or r).lower() for r in routes}
+    try:
+        alerts = realtime.alerts()
+    except realtime.SeptaAPIError as e:
+        return {"alerts_error": str(e)}
+    relevant = [
+        a for a in alerts
+        if a["mode"] == "systemwide" or (a["mode"] == "bus" and str(a.get("route_name", "")).lower() in names)
+    ]
+    return {"service_alerts": relevant} if relevant else {}
+
+
+def _corner_dict(feed, corner) -> dict:
+    return {
+        "name": corner.name,
+        "stop_id": corner.stop_id,
+        "routes": feed.routes_label(corner.routes),
+        "wheelchair_accessible": corner.wheelchair,
+    }
+
+
+@mcp.tool(annotations=READ_ONLY)
+def find_bus_stop(query: str, route: str | None = None) -> dict:
+    """Look up SEPTA bus stops, optionally on one route ("42", "K").
+
+    query: cross streets in either order ("Broad and Walnut", "Walnut St & Broad St"), one
+    street ("Chelten Av"), or the stop number on the sign ("stop 10266"). Each result is a
+    corner, with the routes stopping on any side of it.
+    """
+    try:
+        feed = _bus_feed()
+        routes = _bus_routes(feed, route)
+    except (ValueError, FeedUnavailable) as e:
+        return {"error": str(e)}
+    return {"query": query, "stops": [_corner_dict(feed, c) for c in feed.search_stops(query, routes)]}
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def bus_schedule(
+    from_stop: str,
+    to_stop: str,
+    date: str = "today",
+    depart_after: str | None = None,
+    depart_before: str | None = None,
+    route: str | None = None,
+    max_results: int = 20,
+) -> dict:
+    """Scheduled SEPTA buses (and trackless trolleys) from one stop to another on a given
+    day, on routes that go directly between them.
+
+    Args:
+        from_stop / to_stop: Cross streets in either order ("Broad and Olney"), or the stop
+            number on the sign ("stop 10266").
+        date: "today", "tomorrow", a weekday name, or YYYY-MM-DD.
+        depart_after / depart_before: Departure window, e.g. "07:00" or "7:30 AM". Defaults
+            to now (or start of day) through the end of the service day.
+        route: Only this route, e.g. "42" or "K". Also picks the right stop when a name is
+            ambiguous.
+        max_results: Cap on trips returned.
+
+    board_at is the corner; board_stop is the stop there the bus leaves from (its name says
+    which side of the street) and board_stop_id the number on its sign. Doesn't plan trips
+    that change buses: without a direct bus it lists the routes at each end. For the next
+    buses with live delays, use bus_departures.
+    """
+    return await anyio.to_thread.run_sync(
+        lambda: _bus_schedule(from_stop, to_stop, date, depart_after, depart_before, route, max_results)
+    )
+
+
+def _bus_schedule(from_stop, to_stop, date, depart_after, depart_before, route, max_results) -> dict:
+    try:
+        day = parse_date(date)
+        after = parse_clock(depart_after)
+        before = parse_clock(depart_before)
+        feed = _bus_feed(day)
+        routes = _bus_routes(feed, route)
+    except (ValueError, FeedUnavailable) as e:
+        return {"error": str(e)}
+    try:
+        origin = feed.resolve_stop(from_stop, routes)
+        dest = feed.resolve_stop(to_stop, routes)
+    except (StationNotFound, AmbiguousStation) as e:
+        return _station_error(e)
+    if origin.stop_id == dest.stop_id:
+        return {"error": "Origin and destination are the same stop."}
+
+    ws, we = _window(day, after, before)
+    result = _schedule_header(feed, origin, dest, day, ws, we)
+    rides = feed.rides(origin, dest, ws, we, routes)
+    result["trips"] = [bus.ride_to_dict(feed, r, day) for r in rides[:max_results]]
+    if len(rides) > max_results:
+        result["more_available"] = len(rides) - max_results
+    if not rides:
+        shared = origin.routes & dest.routes
+        if shared:
+            result["note"] = (
+                f"Routes {feed.routes_label(shared)} serve both stops, but no bus goes from "
+                f"{origin.name} to {dest.name} in this window."
+            )
+            result.update(_bus_alerts(feed, shared))
+        else:
+            result["note"] = (
+                "No bus route goes directly between these stops; the trip needs a change, which "
+                "this tool doesn't plan. Consider a corner both routes serve, or the Metro."
+            )
+            result["routes_at_origin"] = feed.routes_label(origin.routes)
+            result["routes_at_destination"] = feed.routes_label(dest.routes)
+    result["schedule_source"] = feed.summary()
+    return result
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def bus_departures(stop: str, route: str | None = None, count: int = 10) -> dict:
+    """Next buses from a SEPTA bus stop (a corner), with live delays.
+
+    stop: cross streets in either order, or the stop number on the sign. route: only this
+    route ("42", "K"); also picks the right stop when a name is ambiguous. Each departure
+    names the stop it leaves from (board_stop: which side of the street) and its direction
+    (toward). status is live where SEPTA has the bus ("3 min late"), else "scheduled".
+    """
+    try:
+        feed = _bus_feed()
+        routes = _bus_routes(feed, route)
+        corner = feed.resolve_stop(stop, routes)
+    except (StationNotFound, AmbiguousStation) as e:  # before ValueError: they're ValueErrors
+        return _station_error(e)
+    except (ValueError, FeedUnavailable) as e:
+        return {"error": str(e)}
+
+    current = now()
+    # From a while back: a bus that was due 20 minutes ago may be running 25 late.
+    deps = feed.departures(corner, current - timedelta(minutes=45), current + timedelta(hours=6), routes)
+    result: dict = {
+        "stop": corner.name,
+        "routes": feed.routes_label(corner.routes & routes if routes else corner.routes),
+        "as_of": fmt_time(current),
+    }
+    vehicles: dict[str, dict] = {}
+    if deps:
+        try:
+            for vs in (await anyio.to_thread.run_sync(realtime.transit_view_all)).values():
+                vehicles.update({str(v["trip"]): v for v in vs if v["trip"]})
+        except realtime.SeptaAPIError as e:
+            result["live_error"] = str(e)
+
+    out = []
+    for sched, ti, p in deps:
+        trip = feed.trips[ti]
+        v = vehicles.get(trip.trip_id)
+        if v and _already_passed(v, feed.st_seq[p]):
+            continue
+        late = v["minutes_late"] if v else None
+        expected = sched + timedelta(minutes=late) if late is not None else sched
+        if expected < current - timedelta(minutes=1):
+            continue
+        stop_index = feed.st_stop[p]
+        d = {
+            "route": feed.routes.get(trip.route_id, {}).get("route_short_name") or trip.route_id,
+            "route_label": feed.route_label(trip.route_id),
+            "toward": feed.toward(ti),
+            "board_stop": feed.stop_name(stop_index),
+            "board_stop_id": feed.stop_rows[stop_index]["stop_id"],
+            "scheduled": fmt_time(sched),
+        }
+        if v:
+            d["status"] = realtime.late_status(late) or "running, no delay estimate"
+            if late:
+                d["expected"] = fmt_time(expected)
+            d["vehicle"] = v["vehicle"]
+        else:
+            d["status"] = "scheduled"
+        summary = f"{d['route_label']} toward {d['toward']} leaves at {d['scheduled']}"
+        if "expected" in d:
+            summary += f", expected {d['expected']}"
+        out.append((expected, {"summary": f"{summary} ({d['status']}).", **d}))
+        if len(out) >= count * 3:  # enough to sort by expected time
+            break
+    out.sort(key=lambda x: x[0])
+    result["departures"] = [d for _, d in out[:count]]
+    if not result["departures"]:
+        result["note"] = "No buses from this stop in the next six hours."
+        result.update(await anyio.to_thread.run_sync(_bus_alerts, feed, routes or corner.routes))
+    vs, ve = feed.feed_range()
+    if vs and ve and not (vs <= current.date() <= ve):
+        result["warning"] = f"Today is outside the published bus schedule ({vs.isoformat()} to {ve.isoformat()})."
+    return result
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def bus_vehicles(route: str) -> dict:
+    """Where the buses on a SEPTA route are right now: next stop, direction, and how late.
+    route: e.g. "42", "K", "59"."""
+    try:
+        feed = _bus_feed()
+        (route_id,) = feed.resolve_routes(route)
+    except (ValueError, FeedUnavailable) as e:
+        return {"error": str(e)}
+    try:
+        vehicles = await anyio.to_thread.run_sync(realtime.transit_view, route_id)
+    except realtime.SeptaAPIError as e:
+        return {"route": route_id, "error": str(e)}
+    out = []
+    for v in vehicles:
+        d = _vehicle(None, v)
+        if not d["next_stop"] and v["next_stop_id"]:
+            i = feed.stop_index.get(str(v["next_stop_id"]))
+            d["next_stop"] = feed.stop_name(i) if i is not None else None
+        out.append(d)
+    return {"route": feed.route_label(route_id), "as_of": fmt_time(now()), "vehicles": out}
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="SEPTA Regional Rail and Metro MCP server")
+    p = argparse.ArgumentParser(description="SEPTA Regional Rail, Metro and bus MCP server")
     p.add_argument("--transport", choices=["stdio", "http"], default=os.environ.get("MCP_TRANSPORT", "stdio"))
     p.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
     p.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
@@ -1032,10 +1264,11 @@ def main() -> None:
 
     # Load (and if needed download) the timetable up front so the first question is fast.
     log.info("Loaded SEPTA rail schedule: %s", feeds.get().summary())
-    try:
-        log.info("Loaded SEPTA Metro schedule: %s", feeds.get(kind="metro").summary()["feed_version"])
-    except FeedUnavailable as e:
-        log.warning("%s Metro tools will report it.", e)
+    for kind in ("metro", "bus"):
+        try:
+            log.info("Loaded SEPTA %s schedule: %s", kind, feeds.get(kind=kind).summary()["feed_version"])
+        except FeedUnavailable as e:
+            log.warning("%s The %s tools will report it.", e, kind)
 
     if args.transport == "stdio":
         anyio.run(mcp.run_stdio_async)

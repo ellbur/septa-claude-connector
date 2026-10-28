@@ -221,24 +221,104 @@ def normalize(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-class RailFeed:
+class ServiceCalendar:
+    """Which services run on a day, the dates a feed covers, and where it came from: the
+    parts every feed type (rail, Metro, bus) shares."""
+
+    def __init__(self, source: str = "", fetched_at: float | None = None):
+        self.source = source
+        self.fetched_at = fetched_at or time.time()
+        self.calendar: dict[str, dict] = {}
+        self.cal_add: dict[str, set[date]] = {}
+        self.cal_remove: dict[str, set[date]] = {}
+        self.feed_info: dict = {}
+
+    def _read_calendar(self, rows) -> None:
+        """Load calendar.txt, calendar_dates.txt and feed_info.txt via rows(fname)."""
+        for r in rows("calendar.txt"):
+            self.calendar[r["service_id"]] = r
+        for r in rows("calendar_dates.txt"):
+            d = datetime.strptime(r["date"], "%Y%m%d").date()
+            target = self.cal_add if r["exception_type"] == "1" else self.cal_remove
+            target.setdefault(r["service_id"], set()).add(d)
+        fi = rows("feed_info.txt")
+        self.feed_info = fi[0] if fi else {}
+
+    def feed_range(self) -> tuple[date | None, date | None]:
+        def p(k):
+            v = self.feed_info.get(k)
+            return datetime.strptime(v, "%Y%m%d").date() if v else None
+
+        start, end = p("feed_start_date"), p("feed_end_date")
+        if not start or not end:
+            all_dates = [
+                datetime.strptime(c[k], "%Y%m%d").date()
+                for c in self.calendar.values()
+                for k in ("start_date", "end_date")
+            ]
+            if all_dates:
+                start, end = start or min(all_dates), end or max(all_dates)
+        return start, end
+
+    def timetable_changes(self) -> list[date]:
+        """Dates after the feed's start on which a new timetable period begins.
+
+        SEPTA revises a feed in place: the Oct 18 schedule change went out as an edit to
+        the feed starting Sep 27, so these show changes the feed's version date hides.
+        """
+        start, end = self.feed_range()
+        starts = {datetime.strptime(c["start_date"], "%Y%m%d").date() for c in self.calendar.values()}
+        return sorted(d for d in starts if (not start or d > start) and (not end or d <= end))
+
+    def summary(self) -> dict:
+        start, end = self.feed_range()
+        out = {
+            "feed_version": self.feed_info.get("feed_version"),
+            "valid_from": start.isoformat() if start else None,
+            "valid_until": end.isoformat() if end else None,
+            "timetable_changes_included": [d.isoformat() for d in self.timetable_changes()],
+            "downloaded_from": self.source,
+            "downloaded_at": datetime.fromtimestamp(self.fetched_at, TZ).isoformat(timespec="minutes"),
+            "note": (
+                "SEPTA names a feed version after the date the feed starts, not when it was "
+                "published, and adds later schedule changes to the same feed (see "
+                "timetable_changes_included). An early version date doesn't mean the data is stale."
+            ),
+        }
+        if self.source.startswith("http"):
+            out["note"] += " The server checks SEPTA for newer feeds daily."
+        return out
+
+    def services_on(self, d: date) -> set[str]:
+        wd = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"][d.weekday()]
+        active = set()
+        for sid, c in self.calendar.items():
+            start = datetime.strptime(c["start_date"], "%Y%m%d").date()
+            end = datetime.strptime(c["end_date"], "%Y%m%d").date()
+            if start <= d <= end and c.get(wd) == "1":
+                active.add(sid)
+        for sid, ds in self.cal_add.items():
+            if d in ds:
+                active.add(sid)
+        for sid, ds in self.cal_remove.items():
+            if d in ds:
+                active.discard(sid)
+        return active
+
+
+class RailFeed(ServiceCalendar):
     # What resolve_station looks up (for error messages), and the names riders use for it.
     KIND = "Regional Rail station"
     ALIASES = _ALIASES
     GROUPS = _GROUPS
 
     def __init__(self, rail_zip: bytes, source: str = "", fetched_at: float | None = None):
-        self.source = source
-        self.fetched_at = fetched_at or time.time()
+        super().__init__(source, fetched_at)
         self.stops: dict[str, Stop] = {}
         self.routes: dict[str, dict] = {}
         self.trips: dict[str, Trip] = {}
-        self.calendar: dict[str, dict] = {}
-        self.cal_add: dict[str, set[date]] = {}
-        self.cal_remove: dict[str, set[date]] = {}
         self.next_trip: dict[str, str] = {}
         self.prev_trip: dict[str, str] = {}
-        self.feed_info: dict = {}
         # Other stop_ids that resolve to a stop (e.g. a Metro station's platforms).
         self.stop_alias: dict[str, str] = {}
         # stop_id -> [(nearby stop_id, minutes to walk there)], for changing between lines.
@@ -310,21 +390,12 @@ class RailFeed:
                     if st.stop_id in self.stops:
                         self.stops[st.stop_id].routes.add(t.route_id)
 
-            for r in rows("calendar.txt"):
-                self.calendar[r["service_id"]] = r
-            for r in rows("calendar_dates.txt"):
-                d = datetime.strptime(r["date"], "%Y%m%d").date()
-                target = self.cal_add if r["exception_type"] == "1" else self.cal_remove
-                target.setdefault(r["service_id"], set()).add(d)
-
+            self._read_calendar(rows)
             for r in rows("transfers.txt"):
                 # transfer_type 4 = in-seat transfer: same physical train continues.
                 if r.get("transfer_type") == "4" and r.get("from_trip_id") and r.get("to_trip_id"):
                     self.next_trip[r["from_trip_id"]] = r["to_trip_id"]
                     self.prev_trip[r["to_trip_id"]] = r["from_trip_id"]
-
-            fi = rows("feed_info.txt")
-            self.feed_info = fi[0] if fi else {}
 
         # Per-stop index of (trip, position) for fast lookups.
         self.stop_index: dict[str, list[tuple[Trip, int]]] = {}
@@ -341,69 +412,6 @@ class RailFeed:
     def route_name(self, route_id: str) -> str:
         r = self.routes.get(route_id, {})
         return r.get("route_long_name") or r.get("route_short_name") or route_id
-
-    def feed_range(self) -> tuple[date | None, date | None]:
-        def p(k):
-            v = self.feed_info.get(k)
-            return datetime.strptime(v, "%Y%m%d").date() if v else None
-
-        start, end = p("feed_start_date"), p("feed_end_date")
-        if not start or not end:
-            all_dates = [
-                datetime.strptime(c[k], "%Y%m%d").date()
-                for c in self.calendar.values()
-                for k in ("start_date", "end_date")
-            ]
-            if all_dates:
-                start, end = start or min(all_dates), end or max(all_dates)
-        return start, end
-
-    def timetable_changes(self) -> list[date]:
-        """Dates after the feed's start on which a new timetable period begins.
-
-        SEPTA revises a feed in place: the Oct 18 schedule change went out as an edit to
-        the feed starting Sep 27, so these show changes the feed's version date hides.
-        """
-        start, end = self.feed_range()
-        starts = {datetime.strptime(c["start_date"], "%Y%m%d").date() for c in self.calendar.values()}
-        return sorted(d for d in starts if (not start or d > start) and (not end or d <= end))
-
-    def summary(self) -> dict:
-        start, end = self.feed_range()
-        out = {
-            "feed_version": self.feed_info.get("feed_version"),
-            "valid_from": start.isoformat() if start else None,
-            "valid_until": end.isoformat() if end else None,
-            "timetable_changes_included": [d.isoformat() for d in self.timetable_changes()],
-            "downloaded_from": self.source,
-            "downloaded_at": datetime.fromtimestamp(self.fetched_at, TZ).isoformat(timespec="minutes"),
-            "note": (
-                "SEPTA names a feed version after the date the feed starts, not when it was "
-                "published, and adds later schedule changes to the same feed (see "
-                "timetable_changes_included). An early version date doesn't mean the data is stale."
-            ),
-        }
-        if self.source.startswith("http"):
-            out["note"] += " The server checks SEPTA for newer feeds daily."
-        return out
-
-    # -- calendar ----------------------------------------------------------
-
-    def services_on(self, d: date) -> set[str]:
-        wd = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"][d.weekday()]
-        active = set()
-        for sid, c in self.calendar.items():
-            start = datetime.strptime(c["start_date"], "%Y%m%d").date()
-            end = datetime.strptime(c["end_date"], "%Y%m%d").date()
-            if start <= d <= end and c.get(wd) == "1":
-                active.add(sid)
-        for sid, ds in self.cal_add.items():
-            if d in ds:
-                active.add(sid)
-        for sid, ds in self.cal_remove.items():
-            if d in ds:
-                active.discard(sid)
-        return active
 
     # -- stations ----------------------------------------------------------
 
@@ -836,8 +844,9 @@ def gtfs_subset(gtfs_zip: bytes, route_types: set[str]) -> bytes:
 
 
 def _extract_feeds(blob: bytes) -> dict[str, bytes]:
-    """{"rail": ..., "metro": ...} GTFS zips from a gtfs_public.zip bundle. A bare GTFS zip
-    is taken to be the rail feed, and then there's no Metro feed."""
+    """{"rail": ..., "metro": ..., "bus": ...} from a gtfs_public.zip bundle: the rail GTFS,
+    the Metro routes cut from the bus GTFS, and the bus routes in bus.build's compact form.
+    A bare GTFS zip is taken to be the rail feed, and then there's no Metro or bus feed."""
     out: dict[str, bytes] = {}
     with zipfile.ZipFile(io.BytesIO(blob)) as z:
         names = z.namelist()
@@ -847,24 +856,38 @@ def _extract_feeds(blob: bytes) -> dict[str, bytes]:
             if n.endswith("google_rail.zip"):
                 out["rail"] = z.read(n)
             elif n.endswith("google_bus.zip"):
+                bus_gtfs = z.read(n)
                 try:
-                    out["metro"] = gtfs_subset(z.read(n), METRO_ROUTE_TYPES)
+                    out["metro"] = gtfs_subset(bus_gtfs, METRO_ROUTE_TYPES)
                 except Exception:  # noqa: BLE001 - rail still works without it
                     log.exception("Could not extract the Metro routes from %s", n)
+                try:
+                    from . import bus  # bus builds on this module
+
+                    out["bus"] = bus.build(bus_gtfs)
+                except Exception:  # noqa: BLE001
+                    log.exception("Could not extract the bus routes from %s", n)
     if "rail" not in out:
         raise ValueError("Download did not contain google_rail.zip or GTFS files")
     return out
 
 
-def _parse(kind: str, blob: bytes, source: str, fetched_at: float) -> RailFeed:
+def _parse(kind: str, blob: bytes, source: str, fetched_at: float):
+    # metro and bus build on this module
     if kind == "metro":
-        from .metro import MetroFeed  # metro builds on this module
+        from .metro import MetroFeed
 
         return MetroFeed(blob, source=source, fetched_at=fetched_at)
+    if kind == "bus":
+        from .bus import BusFeed
+
+        return BusFeed(blob, source=source, fetched_at=fetched_at)
     return RailFeed(blob, source=source, fetched_at=fetched_at)
 
 
-FEED_NAMES = {"rail": "Regional Rail", "metro": "Metro (subway and trolley)"}
+FEED_NAMES = {"rail": "Regional Rail", "metro": "Metro (subway and trolley)", "bus": "bus"}
+# Bumped when _extract_feeds' output changes, so caches made before are re-downloaded once.
+CACHE_FORMAT = 2
 
 # SEPTA's download URLs only ever have the newest feed, which it publishes a few days
 # before that feed starts. Until then, the feed in effect comes from the GitHub releases.
@@ -877,13 +900,14 @@ def _today() -> date:
 
 
 class FeedManager:
-    """Keeps current rail and Metro feeds, refreshing the cached zips when they get stale.
+    """Keeps current rail, Metro and bus feeds, refreshing the cached zips when they get
+    stale.
 
     Normally that's just the newest feeds. When the newest ones haven't started yet, it
     also keeps the ones in effect today, so dates before the switch still have a timetable.
-    Each download is cached as one zip per kind (google_rail.zip, google_metro.zip) plus a
-    source.json naming where it came from; the "_in_effect" set has the same files with
-    that suffix.
+    Each download is cached as one zip per kind (google_rail.zip, google_metro.zip,
+    google_bus.zip) plus a source.json naming where it came from; the "_in_effect" set has
+    the same files with that suffix. Feeds are parsed the first time they're asked for.
     """
 
     def __init__(
@@ -941,11 +965,14 @@ class FeedManager:
         return [RELEASE_ZIP.format(tag=max(started)[2])]
 
     def _refresh(self, slot: str, urls) -> None:
-        """Re-download slot's feeds from urls() when older than max_age, or when cached
-        before the Metro feed was (no source.json)."""
+        """Re-download slot's feeds from urls() when older than max_age, or when cached in
+        an older CACHE_FORMAT (before the Metro or bus feeds were)."""
         rail = self._path(slot, "rail")
         now = time.time()
-        stale = now - (rail.stat().st_mtime if rail.exists() else 0) > self.max_age or self._meta(slot) is None
+        stale = (
+            now - (rail.stat().st_mtime if rail.exists() else 0) > self.max_age
+            or (self._meta(slot) or {}).get("format") != CACHE_FORMAT
+        )
         if not stale or now - self._last_attempt.get(slot, 0) <= 900:  # don't hammer on failures
             return
         self._last_attempt[slot] = now
@@ -961,7 +988,9 @@ class FeedManager:
                     tmp.replace(path)
                 else:
                     path.unlink(missing_ok=True)
-            (self.data_dir / f"source{slot}.json").write_text(json.dumps({"source": url, "kinds": sorted(feeds)}))
+            (self.data_dir / f"source{slot}.json").write_text(
+                json.dumps({"source": url, "kinds": sorted(feeds), "format": CACHE_FORMAT})
+            )
         except Exception:
             if not rail.exists():
                 raise
@@ -979,9 +1008,9 @@ class FeedManager:
             feed = self._feeds[(slot, kind)] = _parse(kind, path.read_bytes(), source, mtime)
         return feed
 
-    def get(self, day: date | None = None, kind: str = "rail") -> RailFeed:
-        """The `kind` feed ("rail" or "metro") with the timetable for `day` (default
-        today): the newest one covering it."""
+    def get(self, day: date | None = None, kind: str = "rail"):
+        """The `kind` feed ("rail", "metro" or "bus") with the timetable for `day`
+        (default today): the newest one covering it."""
         with self._lock:
             if self.local_zip:
                 if self._local is None:
@@ -1000,7 +1029,7 @@ class FeedManager:
             if latest is None:
                 if not self._path("", "rail").exists():
                     raise RuntimeError("SEPTA GTFS download failed recently; retrying later")
-                if self._meta("") is None:  # cached before Metro support, and the refresh failed
+                if (self._meta("") or {}).get("format") != CACHE_FORMAT:  # old cache, and the refresh failed
                     raise FeedUnavailable(f"The {FEED_NAMES[kind]} schedule isn't downloaded yet; retrying later.")
                 raise FeedUnavailable(f"SEPTA's download had no {FEED_NAMES[kind]} schedule.")
             feeds = [latest]

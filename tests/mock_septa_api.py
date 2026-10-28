@@ -93,11 +93,21 @@ ALERTS = [
 ]
 
 
+BUS_42 = [
+    {"lat": "39.95265", "lng": "-75.20951", "label": "3677", "VehicleID": "3677", "route_id": "42",
+     "trip": "880000", "BlockID": "4201", "Direction": "Westbound", "destination": "Wycombe", "heading": 270,
+     "late": 6, "next_stop_id": "10266", "next_stop_name": None, "next_stop_sequence": 12,
+     "estimated_seat_availability": "FEW_SEATS_AVAILABLE", "Offset": 6, "Offset_sec": "360"},
+]
+
+
 def transit_view(q):
     """TransitView: vehicles on a bus/trolley route. Subway routes come back empty."""
+    now = int(datetime.now().timestamp())
+    if q.get("route") == ["42"]:
+        return {"bus": [{**v, "timestamp": now - 20} for v in BUS_42]}
     if q.get("route") != ["T1"]:
         return []
-    now = int(datetime.now().timestamp())
     return {"bus": [
         {"lat": "39.976337", "lng": "-75.236602", "label": "9024", "route_id": "T1", "trip": "968292",
          "VehicleID": "9024", "BlockID": "9551", "Direction": "Eastbound", "destination": "13th St",
@@ -126,6 +136,11 @@ ROUTES = {
         f"An invalid parameter was used. No train found with train #{q.get('req1', [''])[0]}."),
     "/api/Alerts/get_alert_data.php": lambda q: ALERTS,
     "/api/TransitView/index.php": transit_view,
+    # Every route at once; the real one is ~300 KB.
+    "/api/TransitViewAll/index.php": lambda q: {"routes": [{
+        "42": transit_view({"route": ["42"]})["bus"],
+        "T1": transit_view({"route": ["T1"]})["bus"],
+    }]},
 }
 
 REQUESTS: list[tuple[str, dict]] = []

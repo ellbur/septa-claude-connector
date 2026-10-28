@@ -1,4 +1,4 @@
-# SEPTA Regional Rail and Metro connector for Claude
+# SEPTA Regional Rail, Metro and bus connector for Claude
 
 An MCP server that lets Claude answer questions like:
 
@@ -7,13 +7,14 @@ An MCP server that lets Claude answer questions like:
 - "Where is train 5305 right now?"
 - "How do I get from Erie to 2nd Street on the subway?"
 - "When's the next T3 trolley from 30th Street, and is it running late?"
+- "When does the 42 leave Broad and Walnut, and where is it now?"
 - "Any problems on the Media/Wawa line, the El, or the 42 bus today?"
 
-It covers Regional Rail and the SEPTA Metro: the subway (L1 Market-Frankford Line, B1/B2
-Broad Street Line, B3 Broad-Ridge Spur), the trolleys (T1–T5, G1, D1, D2) and the M1
+It covers Regional Rail, buses and the SEPTA Metro: the subway (L1 Market-Frankford Line,
+B1/B2 Broad Street Line, B3 Broad-Ridge Spur), the trolleys (T1–T5, G1, D1, D2) and the M1
 Norristown High Speed Line. It combines SEPTA's published **GTFS** timetables (for any date
 in the current schedule) with SEPTA's **real-time API** (live delays, tracks, train and
-trolley positions, and alerts for every mode, buses included).
+trolley and bus positions, and alerts for every mode).
 
 ## Tools
 
@@ -28,6 +29,10 @@ trolley positions, and alerts for every mode, buses included).
 | `metro_departures(stop, line, count)` | GTFS + live (TransitView) | Next departures from a Metro station or trolley stop, with live delays for trolleys and the M1. |
 | `metro_vehicles(line)` | Live (TransitView) | Where a line's trolleys are, their next stops and how late. |
 | `find_metro_stop(query, line)` | GTFS | Resolving Metro station and trolley stop names. |
+| `bus_schedule(from_stop, to_stop, date, depart_after, depart_before, route)` | GTFS | Buses that go directly between two stops, for any day. |
+| `bus_departures(stop, route, count)` | GTFS + live (TransitViewAll) | Next buses from a stop, with live delays and which side of the street each leaves from. |
+| `bus_vehicles(route)` | Live (TransitView) | Where a route's buses are and how late. |
+| `find_bus_stop(query, route)` | GTFS | Bus stops by cross streets or stop number. |
 | `service_alerts(line, mode)` | Live (Alerts) | Advisories and detours for Regional Rail, Metro and bus routes. |
 
 The Regional Rail tools and the Metro tools are separate: none plans a trip that mixes the
@@ -76,6 +81,17 @@ one stop per station, by parent station and by name, so transfers between lines 
 links stations within a short walk of each other (Girard Av & Front St on the G1 and
 Front-Girard on the L1) so itineraries can include the walk.
 
+**The bus feed is big.** It has ~2.8 million stop times, about 15 times the Metro's;
+parsed into Python objects like the rail and Metro feeds it would need several hundred MB.
+`bus.py` converts it once per download into a compact form (stop times as flat int
+arrays), which loads in about a second and takes ~70 MB.
+
+**Bus stops are corners.** The feed names each stop after the street the bus is on first,
+so the same intersection is "Broad St & Walnut St" for one route and "Walnut St & Broad St"
+for another, with a stop on each side. Stops are grouped by their set of streets, so
+"Broad and Walnut" in either order, or the number on the stop's sign, finds the corner, and
+results say which stop there (side of the street, and its number) each bus leaves from.
+
 **No live subway data.** SEPTA's real-time JSON API reports trolley and M1 positions and
 delays (TransitView), but nothing for the L1 or the Broad Street Line; its GTFS-realtime
 feed has no real subway data either. And riders can't count on a subway train's minute,
@@ -98,8 +114,8 @@ septa-mcp                                # stdio, for local MCP clients
 ```
 
 On first start it downloads SEPTA's schedules (≈27 MB) from SEPTA, falling back to SEPTA's
-GitHub releases, and re-checks daily. It keeps the rail feed and the Metro routes cut from
-the bus feed, about 2.3 MB together. SEPTA publishes a new feed every few weeks,
+GitHub releases, and re-checks daily. It keeps the rail feed and the Metro and bus routes
+from the bus feed, about 12 MB together. Processing a new download takes 10–15 seconds. SEPTA publishes a new feed every few weeks,
 a few days before it takes effect, and its download link switches to it right away; until the
 new feed starts, the server also keeps the one in effect (from the GitHub releases) and answers
 each date from the feed that covers it. Results include `valid_from`/`valid_until`, and a
@@ -131,6 +147,10 @@ traffic fits in Cloud Run's free tier):
 gcloud auth login
 PROJECT=my-gcp-project ./deploy.sh    # optional: REGION, SERVICE, BUCKET
 ```
+
+The service gets 1 GiB of memory: with every feed loaded, and the next schedule too in the
+days before it starts, the server uses up to ~350 MB, and processing a download briefly
+adds ~170 MB more.
 
 It mounts a Cloud Storage bucket at `/data` so the schedule survives cold starts and is
 downloaded at most once a day, and caps the service at one instance so the real-time API
@@ -185,11 +205,9 @@ you can also run it standalone for offline development.
 
 ## Limits
 
-- Bus schedules aren't covered (only bus alerts), nor are the trackless trolleys (59, 66,
-  75, which run like buses), NJ Transit, PATCO and Amtrak. The bus routes are in the same
-  GTFS download, but at ~3 million stop times they need a database rather than the
-  in-memory approach used here.
-- No trip planning across Regional Rail and the Metro.
+- NJ Transit, PATCO and Amtrak aren't covered.
+- No trip planning across modes, and bus trips only on routes that go directly: a bus
+  trip that needs a change is planned leg by leg.
 - Transfer itineraries are limited to one transfer; that covers any pair of Regional Rail
   stations and most Metro trips.
 - SEPTA's real-time API is unofficially documented and its response formats occasionally

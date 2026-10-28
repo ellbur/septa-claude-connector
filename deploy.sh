@@ -30,7 +30,7 @@ gcloud run deploy "$SERVICE" \
   --project "$PROJECT" --region "$REGION" --source . \
   --allow-unauthenticated \
   --min-instances 0 --max-instances 1 --concurrency 80 \
-  --cpu 1 --memory 512Mi --timeout 60 \
+  --cpu 1 --memory 1Gi --timeout 60 \
   --execution-environment gen2 \
   --add-volume "name=cache,type=cloud-storage,bucket=$BUCKET" \
   --add-volume-mount "volume=cache,mount-path=/data"
