@@ -24,9 +24,10 @@ CACHE_SECONDS = 24 * 3600
 MIN_INTERVAL = 1.0  # seconds between requests, per Nominatim's usage policy
 ATTRIBUTION = "Place data © OpenStreetMap contributors (ODbL)"
 
-# west, north, east, south: Philadelphia and its Pennsylvania suburbs, out to Trenton,
-# Wilmington and the edges of Chester and Bucks counties.
-VIEWBOX = (-76.15, 40.65, -74.55, 39.5)
+# west, north, east, south: a few km past SEPTA's outermost stops (Coatesville, Doylestown,
+# Trenton, Newark DE). Any wider and a short name like "Temple" matches a Berks County village
+# before anything a rider means.
+VIEWBOX = (-75.9, 40.45, -74.55, 39.5)
 
 # Nominatim address types that are areas a rider might mean as a whole.
 AREA_KINDS = {

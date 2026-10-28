@@ -225,7 +225,7 @@ For local use only, point a desktop MCP client at the stdio command instead:
 
 ```bash
 uv run --extra dev pytest -q      # or: pip install -e ".[dev]" && pytest -q
-SEPTA_LIVE=1 pytest -q tests/test_live.py   # against SEPTA's real servers
+SEPTA_LIVE=1 pytest -q tests/test_live.py   # against SEPTA's real servers and Nominatim
 ```
 
 Schedule tests run against the real GTFS feed (downloaded, or `SEPTA_GTFS_ZIP`).
