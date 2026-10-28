@@ -352,7 +352,7 @@ class RailFeed:
             ),
         }
         if self.source.startswith("http"):
-            out["note"] += " This is the latest feed SEPTA had published at downloaded_at; it's re-checked daily."
+            out["note"] += " The server checks SEPTA for newer feeds daily."
         return out
 
     # -- calendar ----------------------------------------------------------
@@ -671,22 +671,45 @@ def fmt_time_on(dt: datetime, query_date: date | None) -> str:
     return fmt_time(dt) + (" (next day)" if query_date and dt.date() > query_date else "")
 
 
+def train_summary(t: dict) -> str:
+    """One sentence restating a train entry, so the model needn't infer what
+    final_stop, depart and arrive refer to."""
+    ident = f"Train {t.get('train')}"
+    if t.get("final_stop"):
+        ident += f" (final stop {t['final_stop']})"
+    elif t.get("line"):
+        ident += f" ({t['line']} line)"
+    s = f"{ident} leaves {t.get('board_at')} at {t.get('depart')} and arrives at {t.get('get_off_at')} at {t.get('arrive')}"
+    status = str(t.get("status") or "").strip()
+    if status:
+        late = re.fullmatch(r"(\d+) mins?", status, re.I)
+        s += f" ({late.group(1)} min late)" if late else f" ({status})"
+    return s + "."
+
+
+def with_summary(t: dict) -> dict:
+    return {"summary": train_summary(t), **t}
+
+
 def ride_to_dict(feed: RailFeed, r: Ride, query_date: date | None = None) -> dict:
-    # Riders find their train by number and destination, which is what platform boards
+    # Riders find their train by number and final stop, which is what platform boards
     # show. Line names are left out: a through-routed train changes line in Center City,
-    # so the line at the boarding station can look like the wrong train.
+    # so the line at the boarding station can look like the wrong train. Both stations
+    # are named so "arrive" isn't mistaken for the arrival at the final stop.
     dep, arr = r.depart_dt, r.arrive_dt
     d = {
         "train": r.train,
-        "destination": feed.destination(r.board_trip, feed.services_on(r.service_date)),
+        "final_stop": feed.destination(r.board_trip, feed.services_on(r.service_date)),
+        "board_at": feed.stops[r.board.stop_id].name,
         "depart": fmt_time_on(dep, query_date),
+        "get_off_at": feed.stops[r.alight.stop_id].name,
         "arrive": fmt_time_on(arr, query_date),
         "duration_min": int((arr - dep).total_seconds() // 60),
         "intermediate_stops": r.stops_between,
     }
     if query_date and dep.date() != query_date:
         d["depart_date"] = dep.date().isoformat()
-    return d
+    return with_summary(d)
 
 
 # ---------------------------------------------------------------------------

@@ -14,16 +14,26 @@ from mcp.server.mcpserver import MCPServer
 from mcp_types import ToolAnnotations
 
 from . import realtime
-from .gtfs import TZ, AmbiguousStation, FeedManager, StationNotFound, fmt_time, fmt_time_on, ride_to_dict
+from .gtfs import (
+    TZ,
+    AmbiguousStation,
+    FeedManager,
+    StationNotFound,
+    fmt_time,
+    fmt_time_on,
+    ride_to_dict,
+    with_summary,
+)
 
 log = logging.getLogger("septa_mcp")
 
 INSTRUCTIONS = """\
 SEPTA Regional Rail (Philadelphia commuter trains) schedules and live status.
 
-- Trains are identified by number and final destination, which is how station boards list
-  them. A train's destination can be past the rider's stop or on another line's branch;
-  that's normal, not a sign of the wrong train.
+- Trains are identified by number and final_stop (where the train ends), which is how
+  station boards list them. A train's final_stop can be past the rider's stop or on another
+  line's branch; that's normal, not a sign of the wrong train. depart and arrive are the
+  times at board_at and get_off_at, the rider's own stations, not the train's ends.
 - Station names are matched loosely ("Jefferson", "30th Street", "Temple"). If a name is
   ambiguous the tool returns the candidates; ask the user or pick from context.
 - Shuttle buses that replace trains (see service_alerts) are part of the trip. If an alert
@@ -287,6 +297,12 @@ def _train_schedule(
             result["note"] = "No direct trains; these itineraries need one transfer."
             result["itineraries"] = [
                 {
+                    "summary": (
+                        f"Leave {origin.name} at {fmt_time_on(l1.depart_dt, day)} on train {l1.train}, "
+                        f"change at {feed.stops[l1.alight.stop_id].name} to train {l2.train} "
+                        f"({int((l2.depart_dt - l1.arrive_dt).total_seconds() // 60)} min wait), "
+                        f"arrive at {dest.name} at {fmt_time_on(l2.arrive_dt, day)}."
+                    ),
                     "depart": fmt_time_on(l1.depart_dt, day),
                     "arrive": fmt_time_on(l2.arrive_dt, day),
                     "duration_min": int((l2.arrive_dt - l1.depart_dt).total_seconds() // 60),
@@ -335,18 +351,44 @@ def _partial_note(dest, end, have_alerts: bool) -> str:
     return note
 
 
-def _with_destination(feed, train: dict) -> dict:
-    """Swap the live API's line name for the train's destination, looked up by train
-    number in the timetable. The line is the one at the boarding station, so a
-    through-routed train to Claymont shows as "Chestnut Hill East" at Suburban."""
+def _with_final_stop(feed, train: dict, board_at: str, get_off_at: str) -> dict:
+    """Swap the live API's line name for the train's final stop, looked up by train
+    number in the timetable, and name the stations that depart/arrive refer to. The line
+    is the one at the boarding station, so a through-routed train to Claymont shows as
+    "Chestnut Hill East" at Suburban."""
+    train = {k: v for k, v in train.items() if k != "at"}
+    head = {"train": train.pop("train", None)}
     today = now().date()
     # After midnight a train may belong to yesterday's service day.
     for day in (today, today - timedelta(days=1)):
-        dest = feed.train_destination(str(train.get("train") or ""), day)
-        if dest:
-            rest = {k: v for k, v in train.items() if k not in ("train", "line")}
-            return {"train": train.get("train"), "destination": dest, **rest}
-    return train  # not in the timetable (e.g. an extra train): the line is all there is
+        final = feed.train_destination(str(head["train"] or ""), day)
+        if final:
+            head["final_stop"] = final
+            train.pop("line", None)
+            break
+    else:  # not in the timetable (e.g. an extra train): the line is all there is
+        head["line"] = train.pop("line", None)
+    head["board_at"] = board_at
+    head["depart"] = train.pop("depart", None)
+    head["get_off_at"] = get_off_at
+    head["arrive"] = train.pop("arrive", None)
+    return with_summary({**head, **train})
+
+
+def _with_final_stops(feed, trains: list[dict], origin: str, dest: str) -> list[dict]:
+    out = []
+    for t in trains:
+        if "connection" in t:
+            at = t["connection"].get("at")
+            try:  # the live API's name for the station, e.g. "Temple U"
+                at = feed.resolve_station(at).name
+            except (StationNotFound, AmbiguousStation, AttributeError):
+                pass
+            t["connection"] = _with_final_stop(feed, t["connection"], at, dest)
+            out.append(_with_final_stop(feed, t, origin, at))
+        else:
+            out.append(_with_final_stop(feed, t, origin, dest))
+    return out
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -377,10 +419,7 @@ async def next_trains(from_station: str, to_station: str, count: int = 5) -> dic
             "trains": fallback.get("trains") or fallback.get("itineraries") or [],
             **{k: fallback[k] for k in ("partial_service", "note") if k in fallback},
         }
-    trains = [_with_destination(feed, t) for t in trains]
-    for t in trains:
-        if "connection" in t:
-            t["connection"] = _with_destination(feed, t["connection"])
+    trains = _with_final_stops(feed, trains, origin.name, dest.name)
     result = {**base, "source": "SEPTA real-time API", "trains": trains}
     if not trains:
         result.update(await anyio.to_thread.run_sync(_station_alerts, origin, dest))
@@ -400,7 +439,7 @@ async def _live_partial_service(feed, origin, dest, count: int, have_alerts: boo
     out: dict = {"rail_service_ends_at": end.name}
     try:
         live = await anyio.to_thread.run_sync(realtime.next_to_arrive, origin.name, end.name, count)
-        out["trains"] = [_with_destination(feed, t) for t in live]
+        out["trains"] = _with_final_stops(feed, live, origin.name, end.name)
     except realtime.SeptaAPIError as e:
         live = []
         out["live_error"] = str(e)
@@ -416,7 +455,7 @@ async def station_departures(
     count: int = 10,
     direction: Literal["N", "S"] | None = None,
 ) -> dict:
-    """Live departure board for a Regional Rail station: upcoming trains, destinations,
+    """Live departure board for a Regional Rail station: upcoming trains, final stops,
     delays and track numbers.
 
     direction: "N" or "S" as SEPTA labels trains at that station (roughly: N = headed

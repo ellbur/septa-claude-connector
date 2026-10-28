@@ -16,7 +16,7 @@ with SEPTA's **real-time API** (live delays, tracks, train positions, alerts).
 |---|---|---|
 | `train_schedule(from_station, to_station, date, depart_after, depart_before)` | GTFS | Timetable questions for any day. Falls back to one-transfer itineraries when there's no direct train. |
 | `next_trains(from_station, to_station, count)` | Live (NextToArrive) | "Next train" right now, with delay status. Falls back to the timetable if the live API is down. |
-| `station_departures(station, count, direction)` | Live (Arrivals) | A station's departure board: destinations, delays, track numbers. |
+| `station_departures(station, count, direction)` | Live (Arrivals) | A station's departure board: final stops, delays, track numbers. |
 | `train_status(train_number)` | Live (TrainView + RRSchedules) | Where a train is, how late, stop-by-stop estimates. |
 | `rail_alerts(line)` | Live (Alerts) | Service advisories and disruptions. |
 | `find_station(query)` | GTFS | Resolving vague or ambiguous station names. |
@@ -43,7 +43,7 @@ as two trips joined by an in-seat transfer, so a naive "trips serving both stati
 finds only a handful of the Jefferson → Swarthmore trains. This server stitches those trips
 back together, so you see every train.
 
-Trains are reported by number and final `destination`, the way platform boards list them,
+Trains are reported by number and `final_stop`, the way platform boards list them,
 rather than by line. The line name a train has at your boarding station can belong to the
 other half of its run, e.g. a Suburban → Claymont train shows up as "Chestnut Hill East".
 

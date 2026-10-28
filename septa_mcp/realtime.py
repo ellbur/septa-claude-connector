@@ -265,7 +265,7 @@ def arrivals(station: str, count: int = 10, direction: str | None = None) -> dic
                 result[bucket].append(
                     {
                         "train": t.get("train_id"),
-                        "destination": t.get("destination"),
+                        "final_stop": t.get("destination"),
                         "origin": t.get("origin"),
                         "scheduled": _clock(t.get("sched_time")),
                         "departs": _clock(t.get("depart_time")),

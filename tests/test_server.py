@@ -98,7 +98,12 @@ def test_jefferson_to_swarthmore_saturday_morning():
     # that a naive GTFS query would miss.
     assert len(trains) >= 4
     # Named by where the train ends up, as platform boards show it, not by line.
-    assert all(t["destination"] == "Wawa" and "line" not in t for t in trains)
+    assert all(t["final_stop"] == "Wawa" and "line" not in t for t in trains)
+    # depart/arrive name their stations, so "arrive" isn't read as the final stop's time.
+    assert all(t["board_at"] == "Jefferson Station" and t["get_off_at"] == "Swarthmore" for t in trains)
+    t = trains[0]
+    assert t["summary"] == (f"Train {t['train']} (final stop Wawa) leaves Jefferson Station at {t['depart']} "
+                            f"and arrives at Swarthmore at {t['arrive']}.")
     assert all(20 <= t["duration_min"] <= 50 for t in trains)
 
 
@@ -117,6 +122,9 @@ def test_transfer_itinerary():
     assert r["itineraries"][0]["transfer_at"] in {
         "Suburban Station", "Gray 30th St Station", "Jefferson Station", "Penn Medicine Station"
     }
+    it = r["itineraries"][0]
+    assert it["summary"].startswith(f"Leave Cynwyd at {it['depart']}")
+    assert f"change at {it['transfer_at']}" in it["summary"] and it["summary"].endswith(f"arrive at Media at {it['arrive']}.")
 
 
 def test_find_station():
@@ -134,6 +142,8 @@ def test_next_trains_live():
     # 5301 left hours ago; the real API still lists such trains and they must be dropped.
     assert [t["train"] for t in r["trains"]] == ["5317", "5321"]
     assert r["trains"][0]["status"] == "3 min" and r["trains"][0]["direct"] is True
+    assert r["trains"][0]["board_at"] == "Jefferson Station" and r["trains"][0]["get_off_at"] == "Swarthmore"
+    assert "arrives at Swarthmore" in r["trains"][0]["summary"] and r["trains"][0]["summary"].endswith("(3 min late).")
     path, q = mock_septa_api.REQUESTS[-1]
     assert q["req1"] == ["Jefferson Station"] and q["req2"] == ["Swarthmore"]
 
@@ -341,17 +351,29 @@ def test_in_effect_release_is_newest_started(monkeypatch):
     assert urls == ["https://github.com/septadev/GTFS/releases/download/v202609271/gtfs_public.zip"]
 
 
-def test_next_trains_use_destination_not_line():
+def test_next_trains_use_final_stop_not_line():
     feed = server.feeds.get()
     today = server.now().date()
     active = feed.services_on(today)
     # A through-routed train running today: its live line name is the first segment's.
     t = next(t for t in feed.trips.values() if t.service_id in active and t.trip_id in feed.next_trip
              and t.trip_id not in feed.prev_trip)
-    live = {"train": t.train, "line": feed.route_name(t.route_id), "depart": "1:00PM"}
-    out = server._with_destination(feed, live)
-    assert list(out)[:2] == ["train", "destination"] and "line" not in out
+    live = {"train": t.train, "line": feed.route_name(t.route_id), "depart": "1:00PM", "arrive": "1:30PM"}
+    out = server._with_final_stop(feed, live, "Suburban Station", "Wayne")
+    assert list(out)[:7] == ["summary", "train", "final_stop", "board_at", "depart", "get_off_at", "arrive"]
+    assert "line" not in out
     last = list(feed._chain_forward(t, active))[-1]
-    assert out["destination"] == last.headsign
+    assert out["final_stop"] == last.headsign
     # Unknown trains keep the line, since there's nothing better to say.
-    assert server._with_destination(feed, {"train": "0000", "line": "Airport"})["line"] == "Airport"
+    assert server._with_final_stop(feed, {"train": "0000", "line": "Airport"}, "A", "B")["line"] == "Airport"
+
+
+def test_next_trains_connection_names_each_legs_stations():
+    feed = server.feeds.get()
+    live = [{"train": "0000", "line": "Paoli/Thorndale", "depart": "1:00PM", "arrive": "1:10PM", "direct": False,
+             "connection": {"at": "Temple U", "train": "0001", "line": "Lansdale/Doylestown",
+                            "depart": "1:20PM", "arrive": "2:00PM"}}]
+    (t,) = server._with_final_stops(feed, live, "Wayne", "Lansdale")
+    assert (t["board_at"], t["get_off_at"]) == ("Wayne", "Temple University")  # API name translated
+    c = t["connection"]
+    assert (c["board_at"], c["get_off_at"]) == ("Temple University", "Lansdale") and "at" not in c
