@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import logging
 import os
 import re
@@ -704,8 +705,22 @@ def _extract_rail_zip(blob: bytes) -> bytes:
     raise ValueError("Download did not contain google_rail.zip or GTFS files")
 
 
+# SEPTA's download URLs only ever have the newest feed, which it publishes a few days
+# before that feed starts. Until then, the feed in effect comes from the GitHub releases.
+RELEASES_API = "https://api.github.com/repos/septadev/GTFS/releases?per_page=30"
+RELEASE_ZIP = "https://github.com/septadev/GTFS/releases/download/{tag}/gtfs_public.zip"
+
+
+def _today() -> date:
+    return datetime.now(TZ).date()
+
+
 class FeedManager:
-    """Keeps a current RailFeed, refreshing the cached zip when it gets stale."""
+    """Keeps current RailFeeds, refreshing the cached zips when they get stale.
+
+    Normally that's just the newest feed. When the newest one hasn't started yet, it also
+    keeps the one in effect today, so dates before the switch still have a timetable.
+    """
 
     def __init__(
         self,
@@ -718,17 +733,17 @@ class FeedManager:
         self.urls = urls or [u for u in os.environ.get("SEPTA_GTFS_URLS", "").split(",") if u] or DEFAULT_GTFS_URLS
         self.max_age = max_age_hours * 3600
         self.local_zip = local_zip or os.environ.get("SEPTA_GTFS_ZIP")
-        self._feed: RailFeed | None = None
+        self._feeds: dict[str, RailFeed] = {}  # cache file name -> parsed feed
         self._lock = threading.Lock()
-        self._last_attempt = 0.0
+        self._last_attempt: dict[str, float] = {}
 
     @property
     def cache_path(self) -> Path:
         return self.data_dir / "google_rail.zip"
 
-    def _download(self) -> tuple[bytes, str]:
+    def _download(self, urls: list[str]) -> tuple[bytes, str]:
         errors = []
-        for url in self.urls:
+        for url in urls:
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
                 with urllib.request.urlopen(req, timeout=60) as resp:
@@ -738,39 +753,84 @@ class FeedManager:
                 log.warning("GTFS download failed from %s: %s", url, e)
         raise RuntimeError("Could not download SEPTA GTFS. " + "; ".join(errors))
 
-    def get(self) -> RailFeed:
+    def _in_effect_urls(self, today: date) -> list[str]:
+        """Download URL of the newest released feed that has started by `today`."""
+        req = urllib.request.Request(RELEASES_API, headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            releases = json.load(resp)
+        # Tags are v<start date><revision>, e.g. v202609271 = second revision of the 9/27 feed.
+        started = [
+            (m.group(1), int(m.group(2)), r["tag_name"])
+            for r in releases
+            if not r.get("draft") and not r.get("prerelease")
+            if (m := re.fullmatch(r"v(\d{8})(\d+)", r.get("tag_name", "")))
+            if m.group(1) <= today.strftime("%Y%m%d")
+        ]
+        if not started:
+            raise RuntimeError("No SEPTA GTFS release found that has started yet")
+        return [RELEASE_ZIP.format(tag=max(started)[2])]
+
+    def _cached(self, name: str, urls, max_age: float) -> RailFeed | None:
+        """The feed cached as data_dir/name, re-downloaded from urls() when older than max_age."""
+        path = self.data_dir / name
+        src_file = path.with_suffix(".source.txt") if name != "google_rail.zip" else self.data_dir / "source.txt"
+        now = time.time()
+        cached_mtime = path.stat().st_mtime if path.exists() else 0
+        if now - cached_mtime > max_age and now - self._last_attempt.get(name, 0) > 900:  # don't hammer on failures
+            self._last_attempt[name] = now
+            try:
+                blob, url = self._download(urls())
+                self.data_dir.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".tmp")
+                tmp.write_bytes(blob)
+                tmp.replace(path)
+                src_file.write_text(url)
+                self._feeds[name] = RailFeed(blob, source=url, fetched_at=now)
+                return self._feeds[name]
+            except Exception:
+                if not path.exists():
+                    raise
+                log.exception("Refresh of %s failed; using cached feed", name)
+        if not path.exists():
+            return None
+        feed = self._feeds.get(name)
+        if feed is None or feed.fetched_at < cached_mtime - 1:
+            feed = self._feeds[name] = RailFeed(
+                path.read_bytes(),
+                source=src_file.read_text() if src_file.exists() else str(path),
+                fetched_at=cached_mtime,
+            )
+        return feed
+
+    def get(self, day: date | None = None) -> RailFeed:
+        """The feed with the timetable for `day` (default today): the newest one covering it."""
         with self._lock:
             if self.local_zip:
-                if self._feed is None:
+                if "local" not in self._feeds:
                     blob = _extract_rail_zip(Path(self.local_zip).read_bytes())
-                    self._feed = RailFeed(blob, source=self.local_zip, fetched_at=os.path.getmtime(self.local_zip))
-                return self._feed
+                    self._feeds["local"] = RailFeed(blob, source=self.local_zip, fetched_at=os.path.getmtime(self.local_zip))
+                return self._feeds["local"]
 
-            now = time.time()
-            cached_mtime = self.cache_path.stat().st_mtime if self.cache_path.exists() else 0
-            stale = now - cached_mtime > self.max_age
-
-            if stale and now - self._last_attempt > 900:  # don't hammer on repeated failures
-                self._last_attempt = now
+            today = _today()
+            latest = self._cached("google_rail.zip", lambda: self.urls, self.max_age)
+            if latest is None:
+                raise RuntimeError("SEPTA GTFS download failed recently; retrying later")
+            feeds = [latest]
+            start, _ = latest.feed_range()
+            if start and start > today:
+                # A released feed never changes, so the cached one is good until it's superseded.
+                in_effect = None
                 try:
-                    blob, url = self._download()
-                    self.data_dir.mkdir(parents=True, exist_ok=True)
-                    tmp = self.cache_path.with_suffix(".tmp")
-                    tmp.write_bytes(blob)
-                    tmp.replace(self.cache_path)
-                    (self.data_dir / "source.txt").write_text(url)
-                    self._feed = RailFeed(blob, source=url, fetched_at=now)
-                    return self._feed
-                except Exception:
-                    if not self.cache_path.exists():
-                        raise
-                    log.exception("Refresh failed; using cached feed")
-
-            if self._feed is None or self._feed.fetched_at < cached_mtime - 1:
-                src_file = self.data_dir / "source.txt"
-                self._feed = RailFeed(
-                    self.cache_path.read_bytes(),
-                    source=src_file.read_text() if src_file.exists() else str(self.cache_path),
-                    fetched_at=cached_mtime,
-                )
-            return self._feed
+                    in_effect = self._cached("google_rail_in_effect.zip", lambda: self._in_effect_urls(today), self.max_age)
+                except Exception:  # noqa: BLE001
+                    log.exception("Could not get the feed in effect before %s", start)
+                if in_effect:
+                    s, e = in_effect.feed_range()
+                    if s and s <= today and (not e or today <= e):
+                        feeds.append(in_effect)
+            day = day or today
+            for f in feeds:
+                s, e = f.feed_range()
+                if s and e and s <= day <= e:
+                    return f
+            return latest

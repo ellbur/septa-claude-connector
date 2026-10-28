@@ -236,7 +236,14 @@ def _train_schedule(
     max_results: int = 25,
     with_alerts: bool = True,
 ) -> dict:
-    feed = feeds.get()
+    try:
+        day = parse_date(date)
+        after = parse_clock(depart_after)
+        before = parse_clock(depart_before)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    feed = feeds.get(day)
     try:
         origin = feed.resolve_station(from_station)
         dest = feed.resolve_station(to_station)
@@ -244,13 +251,6 @@ def _train_schedule(
         return _station_error(e)
     if origin.stop_id == dest.stop_id:
         return {"error": "Origin and destination are the same station."}
-
-    try:
-        day = parse_date(date)
-        after = parse_clock(depart_after)
-        before = parse_clock(depart_before)
-    except ValueError as e:
-        return {"error": str(e)}
 
     current = now()
     if after is None:

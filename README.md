@@ -64,8 +64,11 @@ septa-mcp                                # stdio, for local MCP clients
 ```
 
 On first start it downloads the rail schedule (≈750 KB) from SEPTA, falling back to
-SEPTA's GitHub releases, and re-checks daily. SEPTA publishes a new feed every few weeks;
-results include `valid_from`/`valid_until`, and a warning if you ask about a date outside it.
+SEPTA's GitHub releases, and re-checks daily. SEPTA publishes a new feed every few weeks,
+a few days before it takes effect, and its download link switches to it right away; until the
+new feed starts, the server also keeps the one in effect (from the GitHub releases) and answers
+each date from the feed that covers it. Results include `valid_from`/`valid_until`, and a
+warning if you ask about a date outside it.
 A feed's version is named for its start date, and SEPTA folds later schedule changes into the
 same feed, so results also list `timetable_changes_included` to show the data is current.
 

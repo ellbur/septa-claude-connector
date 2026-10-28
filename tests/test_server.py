@@ -7,6 +7,7 @@ Live-API tests use the mock in mock_septa_api.py.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -24,7 +25,7 @@ os.environ["SEPTA_API_BASE"] = f"http://127.0.0.1:{_mock.server_port}/api"
 
 from mcp import Client  # noqa: E402
 
-from septa_mcp import realtime, server  # noqa: E402
+from septa_mcp import gtfs, realtime, server  # noqa: E402
 from septa_mcp.server import parse_clock, parse_date  # noqa: E402
 
 # In case realtime was imported (e.g. by test_live.py) before the env var was set.
@@ -313,6 +314,31 @@ def test_schedule_source_explains_feed_version():
     start, end = src["valid_from"], src["valid_until"]
     assert all(start < d <= end for d in src["timetable_changes_included"])
     assert "doesn't mean the data is stale" in src["note"]
+
+
+def test_todays_timetable_even_before_newest_feed_starts():
+    # SEPTA publishes each feed days before it starts; until then today needs the old one.
+    today = server.now().date()
+    start, end = server.feeds.get(today).feed_range()
+    assert start <= today <= end
+    r = call("train_schedule", {"from_station": "Jefferson", "to_station": "Swarthmore", "date": "today"})
+    assert "warning" not in r, r
+
+
+def test_in_effect_release_is_newest_started(monkeypatch):
+    releases = [{"tag_name": t} for t in ("v202611010", "v202609271", "v202609270", "v202609061")]
+    releases.append({"tag_name": "v202610250", "draft": True})
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+    monkeypatch.setattr(gtfs.urllib.request, "urlopen", lambda *a, **k: Resp(json.dumps(releases).encode()))
+    urls = gtfs.FeedManager()._in_effect_urls(date(2026, 10, 28))
+    assert urls == ["https://github.com/septadev/GTFS/releases/download/v202609271/gtfs_public.zip"]
 
 
 def test_next_trains_use_destination_not_line():
