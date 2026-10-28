@@ -128,6 +128,39 @@ def transit_view(q):
          "timestamp": now - 3600},
     ]}
 
+def _place(name, kind, category, lat, lon, bbox=None, **extra):
+    """One result as Nominatim's /search?format=jsonv2 gives it."""
+    s, n, w, e = bbox or (lat - 0.0005, lat + 0.0005, lon - 0.0005, lon + 0.0005)
+    return {"place_id": 1, "lat": str(lat), "lon": str(lon), "category": category, "type": kind,
+            "addresstype": kind, "name": name, "display_name": f"{name}, Philadelphia, Pennsylvania, United States",
+            "boundingbox": [str(s), str(n), str(w), str(e)], "importance": 0.5, **extra}
+
+
+def _square(lat, lon, d):
+    return {"type": "Polygon", "coordinates": [[[lon - d, lat - d], [lon + d, lat - d], [lon + d, lat + d],
+                                                [lon - d, lat + d], [lon - d, lat - d]]]}
+
+
+# Stand-in for a Nominatim geocoder (SEPTA_GEOCODER_URL), by lower-cased query.
+PLACES = {
+    "reading terminal market": [_place("Reading Terminal Market", "amenity", "amenity", 39.9533, -75.1590)],
+    "1500 market st": [_place("1500 Market Street", "building", "building", 39.9524, -75.1659)],
+    # A neighborhood the map has only as a point.
+    "fishtown": [_place("Fishtown", "neighbourhood", "place", 39.9718, -75.1340)],
+    # A borough with an outline (when asked for one), and a namesake elsewhere.
+    "media": [_place("Media", "town", "boundary", 39.9168, -75.3877, (39.908, 39.925, -75.397, -75.378)),
+              _place("Media Theatre", "amenity", "amenity", 39.9180, -75.3880)],
+}
+
+
+def geocoder(q):
+    hits = PLACES.get(q.get("q", [""])[0].strip().lower(), [])
+    if q.get("polygon_geojson") == ["1"]:
+        hits = [{**h, "geojson": _square(float(h["lat"]), float(h["lon"]), 0.008)} if h["category"] == "boundary"
+                else h for h in hits]
+    return hits[: int(q.get("limit", ["10"])[0])]
+
+
 ROUTES = {
     "/api/NextToArrive/index.php": next_to_arrive,
     "/api/Arrivals/index.php": lambda q: {} if q.get("station") == ["Wilmington"] else ARRIVALS,
@@ -135,6 +168,7 @@ ROUTES = {
     "/api/RRSchedules/index.php": lambda q: RR_SCHEDULE if q.get("req1") == ["5317"] else BadRequest(
         f"An invalid parameter was used. No train found with train #{q.get('req1', [''])[0]}."),
     "/api/Alerts/get_alert_data.php": lambda q: ALERTS,
+    "/nominatim/search": geocoder,
     "/api/TransitView/index.php": transit_view,
     # Every route at once; the real one is ~300 KB.
     "/api/TransitViewAll/index.php": lambda q: {"routes": [{

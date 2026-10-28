@@ -26,16 +26,19 @@ os.environ["SEPTA_API_BASE"] = f"http://127.0.0.1:{_mock.server_port}/api"
 
 from mcp import Client  # noqa: E402
 
-from septa_mcp import bus, gtfs, metro, realtime, server  # noqa: E402
+from septa_mcp import bus, geocode, gtfs, metro, realtime, server  # noqa: E402
 from septa_mcp.server import parse_clock, parse_date  # noqa: E402
 
 # In case realtime was imported (e.g. by test_live.py) before the env var was set.
 realtime.BASE_URL = os.environ["SEPTA_API_BASE"]
+geocode.GEOCODER_URL = f"http://127.0.0.1:{_mock.server_port}/nominatim/search"
+geocode.MIN_INTERVAL = 0
 
 
 @pytest.fixture(autouse=True)
 def _fresh_api_cache():
     realtime.clear_cache()
+    geocode.clear_cache()
 
 
 def call(tool: str, args: dict) -> dict:
@@ -888,3 +891,99 @@ def test_refresh_feeds_cli(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["septa-mcp", "--refresh-feeds"])
     server.main()  # returns instead of serving
     assert calls == ["refresh"]
+
+
+# -- Finding stops by place --------------------------------------------------------
+
+
+def test_find_place():
+    r = call("find_place", {"query": "Reading Terminal Market"})
+    (p,) = r["places"]
+    assert (p["name"], p["kind"], p["lat"]) == ("Reading Terminal Market", "amenity", 39.9533)
+    assert "OpenStreetMap" in r["attribution"]
+    assert call("find_place", {"query": "Fishtown"})["places"][0]["is_area"] is True
+
+
+def test_find_place_names_stops_too():
+    r = call("find_place", {"query": "Temple University"})
+    assert r["places"] == []
+    assert {"mode": "regional_rail", "name": "Temple University"}.items() <= r["stops_named_like_it"][0].items()
+    r = call("find_place", {"query": "Frankford Transit Center"})
+    assert "metro" in {s["mode"] for s in r["stops_named_like_it"]}
+
+
+def test_find_place_without_a_geocoder(monkeypatch):
+    monkeypatch.setattr(geocode, "GEOCODER_URL", "http://127.0.0.1:9/search")
+    r = call("find_place", {"query": "Temple University"})
+    assert r["places_error"].startswith("Couldn't look up places")
+    assert r["stops_named_like_it"]  # names still work
+
+
+def test_stops_near_a_point():
+    r = call("stops_near", {"lat": 39.9524, "lon": -75.1652, "radius_m": 250})  # 15th & Market
+    by_mode = {}
+    for s in r["stops"]:
+        by_mode.setdefault(s["mode"], s)
+    assert by_mode["metro"]["name"] == "15th St/City Hall" and by_mode["metro"]["walk_min"] <= 2
+    assert by_mode["bus"]["name"] == "15th St & Market St"
+    assert [s["distance_m"] for s in r["stops"]] == sorted(s["distance_m"] for s in r["stops"])
+    assert r["nearest_regional_rail"]["name"] == "Suburban Station"  # just past 250 m
+    route17 = next(b for b in r["bus_routes"] if b["route"] == "17")
+    assert route17["nearest_stop"] == "15th St & Market St"
+    # The stop_id works in the mode's own tools.
+    assert call("bus_departures", {"stop": by_mode["bus"]["stop_id"], "count": 1})["stop"] == "15th St & Market St"
+
+
+def test_stops_near_a_place():
+    r = call("stops_near", {"place": "Reading Terminal Market", "radius_m": 300, "modes": ["regional_rail", "metro"]})
+    assert r["place"]["name"] == "Reading Terminal Market"
+    assert {s["mode"] for s in r["stops"]} <= {"regional_rail", "metro"}
+    assert any(s["name"] == "Jefferson Station" for s in r["stops"])
+    assert "bus_routes" not in r
+    assert "error" in call("stops_near", {"place": "Atlantis"})
+    assert "error" in call("stops_near", {})
+
+
+def test_stops_on_street():
+    r = call("stops_on_street", {"street": "Lancaster Avenue", "limit": 100})
+    assert len(r["stretches"]) > 1  # the city's and the Main Line's, at least
+    city = next(st for st in r["stretches"] if "T1" in st["lines"])
+    crosses = [s["cross_street"] for s in city["stops"]]
+    assert "40th St" in crosses and crosses.index("40th St") < crosses.index("34th St")  # in order
+    assert city["runs"] in ("northwest to southeast", "southeast to northwest")
+    # Near a point: only that stretch, nearby.
+    r = call("stops_on_street", {"street": "lancaster", "lat": 39.9622, "lon": -75.2030, "radius_m": 400})
+    (st,) = r["stretches"]
+    assert "40th St" in [s["cross_street"] for s in st["stops"]]
+    assert call("stops_on_street", {"street": "Nonesuch Blvd"})["stretches"] == []
+    r = call("stops_on_street", {"street": "Lancaster Av", "limit": 5})
+    assert all(len(st["stops"]) <= 5 for st in r["stretches"])
+    assert r["stretches"][0]["stops_not_listed"] == r["stretches"][0]["stop_count"] - 5
+
+
+def test_transit_in_a_town_with_an_outline():
+    r = call("transit_in_area", {"place": "Media"})
+    assert r["boundary"] == "its outline" and r["other_places"] == ["Media Theatre (amenity)"]
+    assert [s["name"] for s in r["regional_rail_stations"]] == ["Media"]
+    assert {t["line"] for t in r["trolley_lines"]} == {"D1"}
+    assert r["metro_stations"] == [] and r["trolley_stops"]  # Media's trolley stops, by name
+    assert r["bus_routes"] and all(b["stops_in_area"] > 0 for b in r["bus_routes"])
+
+
+def test_transit_in_a_neighborhood_without_one():
+    r = call("transit_in_area", {"place": "Fishtown", "modes": ["metro"]})
+    assert r["boundary"].startswith("700 m around its center")
+    assert "Front-Girard" in [s["name"] for s in r["metro_stations"]]
+    assert "bus_routes" not in r and "regional_rail_stations" not in r
+
+
+def test_point_in_outline():
+    square = {"type": "Polygon", "coordinates": [
+        [[0, 0], [4, 0], [4, 4], [0, 4], [0, 0]],
+        [[1, 1], [2, 1], [2, 2], [1, 2], [1, 1]],  # a hole
+    ]}
+    assert geocode.contains(square, 3, 3) and not geocode.contains(square, 1.5, 1.5)
+    assert not geocode.contains(square, 5, 1)
+    multi = {"type": "MultiPolygon", "coordinates": [square["coordinates"], [[[10, 10], [11, 10], [11, 11], [10, 10]]]]}
+    assert geocode.contains(multi, 10.3, 10.6) and geocode.contains(multi, 3, 3)  # (lat, lon)
+    assert not geocode.contains(multi, 10.6, 10.3)

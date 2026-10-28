@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 import re
+from collections import defaultdict
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Literal
 
@@ -13,7 +14,7 @@ import anyio
 from mcp.server.mcpserver import MCPServer
 from mcp_types import ToolAnnotations
 
-from . import bus, metro, realtime
+from . import bus, geocode, metro, places, realtime
 from .gtfs import (
     TZ,
     AmbiguousStation,
@@ -38,6 +39,12 @@ the trolleys T1-T5, G1, D1, D2; and the M1 Norristown High Speed Line) and buses
   find_station. Metro tools: metro_schedule, metro_departures, metro_vehicles,
   find_metro_stop. Bus tools: bus_schedule, bus_departures, bus_vehicles, find_bus_stop.
   service_alerts covers every mode.
+- To find stops from what a rider says, combine: find_place (landmarks, addresses,
+  neighborhoods, towns -> coordinates, plus stops named like it), stops_near (stops of
+  every mode around coordinates or a place, with walking minutes), stops_on_street
+  (stops along a street by cross street), transit_in_area (what serves a neighborhood or
+  town). Their stop_ids work as stops in each mode's tools. Check that a looked-up place
+  is the one the rider meant (other_places), and ask when it's unclear.
 - Regional Rail trains are identified by number and final_stop (where the train ends),
   which is how station boards list them. A train's final_stop can be past the rider's stop
   or on another line's branch; that's normal, not a sign of the wrong train. depart and
@@ -1248,6 +1255,282 @@ async def bus_vehicles(route: str) -> dict:
             d["next_stop"] = feed.stop_name(i) if i is not None else None
         out.append(d)
     return {"route": feed.route_label(route_id), "as_of": fmt_time(now()), "vehicles": out}
+
+
+# ---------------------------------------------------------------------------
+# Finding stops by place: landmarks, addresses, streets, coordinates, areas
+# ---------------------------------------------------------------------------
+
+Mode = Literal["regional_rail", "metro", "bus"]
+_index_cache: tuple[tuple, places.StopIndex] | None = None
+_STOP_ID_NOTE = (
+    "A stop's stop_id works as the stop in its mode's tools: train_schedule/next_trains/"
+    "station_departures for regional_rail, metro_schedule/metro_departures for metro, "
+    "bus_schedule/bus_departures for bus."
+)
+
+
+def _stop_index() -> places.StopIndex:
+    """All modes' stops in one index, rebuilt when a feed is replaced."""
+    global _index_cache
+    current = []
+    for kind in ("rail", "metro", "bus"):
+        try:
+            current.append(feeds.get(kind=kind))
+        except FeedUnavailable:
+            current.append(None)
+    key = tuple(id(f) for f in current)
+    if _index_cache is None or _index_cache[0] != key:
+        _index_cache = (key, places.StopIndex(*current))
+    return _index_cache[1]
+
+
+async def _geocode(query: str, outline: bool = False) -> list:
+    return await anyio.to_thread.run_sync(lambda: geocode.search(query, outline=outline))
+
+
+async def _anchor(place: str | None, lat: float | None, lon: float | None, result: dict) -> tuple[float, float] | None:
+    """The point to search around: lat/lon, or the best match for place (recorded in
+    result, with the other matches). Raises GeocoderError or ValueError."""
+    if lat is not None and lon is not None:
+        return lat, lon
+    if not place:
+        return None
+    found = await _geocode(place)
+    if not found:
+        raise ValueError(
+            f"No place in SEPTA's region matches '{place}'. Try a more specific name, an address, "
+            "or coordinates."
+        )
+    result["place"] = found[0].to_dict()
+    if len(found) > 1:
+        result["other_places"] = [p.to_dict()["name"] + f" ({p.kind})" for p in found[1:]]
+    result["attribution"] = geocode.ATTRIBUTION
+    return found[0].lat, found[0].lon
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def find_place(query: str) -> dict:
+    """Find a landmark, address, neighborhood or town in SEPTA's region: "Reading Terminal
+    Market", "1500 Market St", "Fishtown", "Media", "Penn Presbyterian". Returns matches
+    with coordinates (is_area for neighborhoods and towns), plus any SEPTA stops named like
+    the query (Temple University station for "Temple").
+
+    Then find the stops that serve it with stops_near (lat/lon), stops_on_street, or
+    transit_in_area for a neighborhood or town.
+    """
+    index = await anyio.to_thread.run_sync(_stop_index)
+    result: dict = {"query": query}
+    try:
+        found = await _geocode(query)
+        result["places"] = [p.to_dict() for p in found]
+        if found:
+            result["attribution"] = geocode.ATTRIBUTION
+    except geocode.GeocoderError as e:
+        result["places_error"] = f"{e} Stops can still be found by name, street or coordinates."
+    named = index.named(query)
+    if named:
+        result["stops_named_like_it"] = [s.to_dict() for s in named]
+        result["note"] = _STOP_ID_NOTE
+    if not result.get("places") and not named:
+        result["note"] = "Nothing found. Try a more specific name, an address, a street, or coordinates."
+    return result
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def stops_near(
+    lat: float | None = None,
+    lon: float | None = None,
+    place: str | None = None,
+    radius_m: int = 400,
+    modes: list[Mode] | None = None,
+    limit: int = 12,
+) -> dict:
+    """Stops within walking distance of a point, every mode, nearest first, with walking
+    minutes.
+
+    Give lat/lon, or place (a landmark or address, looked up as in find_place; check the
+    place it matched). radius_m: how far to look (default 400 m, about a 6-minute walk).
+    modes: only these ("regional_rail", "metro", "bus").
+
+    Also lists each bus route nearby with its closest stop, and the nearest Regional Rail
+    station and Metro station even when they're beyond radius_m.
+    """
+    result: dict = {}
+    try:
+        point = await _anchor(place, lat, lon, result)
+    except (geocode.GeocoderError, ValueError) as e:
+        return {"error": str(e)}
+    if point is None:
+        return {"error": "Give lat and lon, or a place."}
+    lat, lon = point
+    radius = max(50, min(radius_m, 3000))
+    index = await anyio.to_thread.run_sync(_stop_index)
+    near = index.near(lat, lon, radius, modes)
+    result.update({"lat": lat, "lon": lon, "radius_m": radius})
+    result["stops"] = [s.to_dict(m) for m, s in near[:limit]]
+    if len(near) > limit:
+        result["more_nearby"] = len(near) - limit
+    routes: dict[str, dict] = {}
+    for m, s in near:
+        if s.mode == "bus":
+            for r in s.lines:
+                routes.setdefault(r, {"route": r, "nearest_stop": s.name, "stop_id": s.stop_id,
+                                      "distance_m": round(m), "walk_min": places.walk_minutes(m)})
+    if routes:
+        result["bus_routes"] = list(routes.values())
+    for mode in ("regional_rail", "metro"):
+        if (not modes or mode in modes) and not any(s.mode == mode for _, s in near):
+            hit = index.nearest(lat, lon, mode)
+            if hit and hit[0] <= 15_000:
+                result[f"nearest_{mode}"] = hit[1].to_dict(hit[0])
+    result["note"] = _STOP_ID_NOTE
+    return result
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def stops_on_street(
+    street: str,
+    place: str | None = None,
+    lat: float | None = None,
+    lon: float | None = None,
+    radius_m: int = 1500,
+    modes: list[Mode] | None = None,
+    limit: int = 40,
+) -> dict:
+    """Bus and trolley stops along a street, in order, by cross street: "Lancaster Av",
+    "Germantown Avenue", "Main St".
+
+    The same street name often exists in several towns, or a street has gaps; each such
+    stretch is listed separately, longest first. To pick one, give place (a landmark,
+    address or town) or lat/lon, and only stops within radius_m of it are listed.
+    """
+    result: dict = {"street": street}
+    try:
+        point = await _anchor(place, lat, lon, result)
+    except (geocode.GeocoderError, ValueError) as e:
+        return {"error": str(e)}
+    index = await anyio.to_thread.run_sync(_stop_index)
+    matched, stretches = index.on_street(street, modes)
+    if point:
+        plat, plon = point
+        stretches = [[s for s in st if places.meters(plat, plon, s.lat, s.lon) <= radius_m] for st in stretches]
+        stretches = [st for st in stretches if st]
+        stretches.sort(key=lambda st: min(places.meters(plat, plon, s.lat, s.lon) for s in st))
+    if not stretches:
+        result["stretches"] = []
+        result["note"] = (
+            f"No stops on '{street}'{' near there' if point else ''}. Stop names abbreviate street "
+            "types (St, Av, Rd, Blvd, Pk); a station name can be found with find_place instead."
+        )
+        return result
+    core = places.street_core(matched)
+
+    def cross(s: places.Located) -> str:
+        others = [v for k, v in s.streets.items() if k != matched and places.street_core(k) != core]
+        return " & ".join(sorted(others)) or s.name
+
+    out = []
+    for st in stretches[:5]:
+        lines = sorted({line for s in st for line in s.lines}, key=lambda r: (len(r), r))
+        entry = {
+            "from": cross(st[0]),
+            "to": cross(st[-1]),
+            "runs": places.direction(st),
+            "stop_count": len(st),
+            "lines": lines,
+            "stops": [{"cross_street": cross(s), **s.to_dict()} for s in st[:limit]],
+        }
+        if len(st) > limit:
+            entry["stops_not_listed"] = len(st) - limit
+        out.append(entry)
+    result["stretches"] = out
+    if len(stretches) > 5:
+        result["other_stretches"] = len(stretches) - 5
+    result["note"] = _STOP_ID_NOTE
+    return result
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def transit_in_area(place: str, modes: list[Mode] | None = None) -> dict:
+    """What serves a neighborhood or town ("Fishtown", "Manayunk", "Media", "Ardmore"):
+    the Regional Rail and Metro stations in it, and each bus route with how many of its
+    stops are there. Uses the area's outline when the map has one; otherwise its bounding
+    box, or a radius around its center (said in boundary).
+    """
+    try:
+        found = await _geocode(place, outline=True)
+    except geocode.GeocoderError as e:
+        return {"error": str(e)}
+    if not found:
+        return {"error": f"No place in SEPTA's region matches '{place}'."}
+    p = next((x for x in found if x.is_area), found[0])
+    result: dict = {"place": p.to_dict()}
+    others = [x for x in found if x is not p]
+    if others:
+        result["other_places"] = [x.to_dict()["name"] + f" ({x.kind})" for x in others]
+    result["attribution"] = geocode.ATTRIBUTION
+
+    if p.geometry:
+        result["boundary"] = "its outline"
+        geometry = p.geometry
+        s_, n_, w_, e_ = p.bbox or (-90, 90, -180, 180)
+
+        def test(lat, lon):
+            return s_ <= lat <= n_ and w_ <= lon <= e_ and geocode.contains(geometry, lat, lon)
+    elif p.bbox and places.meters(p.bbox[0], p.bbox[2], p.bbox[1], p.bbox[3]) >= 300:
+        result["boundary"] = "its bounding box"
+        s_, n_, w_, e_ = p.bbox
+
+        def test(lat, lon):
+            return s_ <= lat <= n_ and w_ <= lon <= e_
+    else:
+        radius = _AREA_RADIUS.get(p.kind, 800)
+        result["boundary"] = f"{radius} m around its center (the map has no outline for it)"
+
+        def test(lat, lon):
+            return places.meters(p.lat, p.lon, lat, lon) <= radius
+
+    index = await anyio.to_thread.run_sync(_stop_index)
+    inside = index.inside(test, modes)
+    rail = [s.to_dict() for s in inside if s.mode == "regional_rail"]
+    metro_stops = [s for s in inside if s.mode == "metro"]
+    bus_counts: dict[str, int] = defaultdict(int)
+    for s in inside:
+        if s.mode == "bus":
+            for r in s.lines:
+                bus_counts[r] += 1
+    if not modes or "regional_rail" in modes:
+        result["regional_rail_stations"] = rail
+    if not modes or "metro" in modes:
+        # Subway and NHSL stations by name; trolley stops, counted by line, unless few.
+        def trolley_only(s):
+            return all(metro.line_info(line).mode == "trolley" for line in s.lines)
+
+        result["metro_stations"] = [s.to_dict() for s in metro_stops if not trolley_only(s)]
+        trolley_stops = [s for s in metro_stops if trolley_only(s)]
+        trolley: dict[str, int] = defaultdict(int)
+        for s in trolley_stops:
+            for line in s.lines:
+                trolley[line] += 1
+        if trolley:
+            result["trolley_lines"] = [{"line": k, "stops_in_area": v} for k, v in sorted(trolley.items())]
+            if len(trolley_stops) <= 12:
+                result["trolley_stops"] = [s.to_dict() for s in trolley_stops]
+    if not modes or "bus" in modes:
+        result["bus_routes"] = [
+            {"route": r, "stops_in_area": n} for r, n in sorted(bus_counts.items(), key=lambda x: (-x[1], len(x[0]), x[0]))
+        ]
+    if not inside:
+        result["note"] = "No stops inside. Try stops_near with its coordinates and a bigger radius."
+    else:
+        result["note"] = "For particular stops, use stops_near or stops_on_street. " + _STOP_ID_NOTE
+    return result
+
+
+# Radius for an area the map gives only as a point, by kind.
+_AREA_RADIUS = {"neighbourhood": 700, "quarter": 700, "suburb": 1200, "city_district": 1500,
+                "hamlet": 1000, "village": 1500, "town": 2000}
 
 
 # ---------------------------------------------------------------------------

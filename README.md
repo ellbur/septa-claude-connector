@@ -8,6 +8,7 @@ An MCP server that lets Claude answer questions like:
 - "How do I get from Erie to 2nd Street on the subway?"
 - "When's the next T3 trolley from 30th Street, and is it running late?"
 - "When does the 42 leave Broad and Walnut, and where is it now?"
+- "What's the closest stop to Reading Terminal Market?" / "What buses run through Fishtown?"
 - "Any problems on the Media/Wawa line, the El, or the 42 bus today?"
 
 It covers Regional Rail, buses and the SEPTA Metro: the subway (L1 Market-Frankford Line,
@@ -34,6 +35,14 @@ trolley and bus positions, and alerts for every mode).
 | `bus_vehicles(route)` | Live (TransitView) | Where a route's buses are and how late. |
 | `find_bus_stop(query, route)` | GTFS | Bus stops by cross streets or stop number. |
 | `service_alerts(line, mode)` | Live (Alerts) | Advisories and detours for Regional Rail, Metro and bus routes. |
+| `find_place(query)` | Geocoder + GTFS | A landmark, address, neighborhood or town → coordinates, plus SEPTA stops named like it. |
+| `stops_near(lat, lon \| place, radius_m, modes)` | GTFS (+ geocoder) | Stops of every mode around a point, with walking minutes; each nearby bus route's closest stop; the nearest rail and Metro stations. |
+| `stops_on_street(street, place \| lat/lon, radius_m)` | GTFS (+ geocoder) | Stops along a street in order, by cross street, one stretch per town or segment. |
+| `transit_in_area(place)` | Geocoder + GTFS | What serves a neighborhood or town: stations, trolley lines, bus routes and how many stops each has there. |
+
+The place tools are meant to be combined: Claude can look up a landmark, list the stops
+near it, then ask a mode's own tools about one of them (every result carries the
+`stop_id` those tools accept).
 
 The Regional Rail tools and the Metro tools are separate: none plans a trip that mixes the
 two, so Claude plans each part and changes at a shared hub (Suburban ↔ 15th St/City Hall,
@@ -91,6 +100,14 @@ so the same intersection is "Broad St & Walnut St" for one route and "Walnut St 
 for another, with a stop on each side. Stops are grouped by their set of streets, so
 "Broad and Walnut" in either order, or the number on the stop's sign, finds the corner, and
 results say which stop there (side of the street, and its number) each bus leaves from.
+
+**Places come from OpenStreetMap.** Landmarks, addresses, neighborhoods and towns are
+looked up with a [Nominatim](https://nominatim.org/) geocoder, limited to SEPTA's region
+(Trenton to Wilmington, out to Chester and Bucks counties). The public server allows one
+request a second from an app that identifies itself, which this keeps to and caches for a
+day; set `SEPTA_GEOCODER_URL` to use another Nominatim-compatible server. Stops near
+coordinates, along a street, or by name work without it. Results credit OpenStreetMap, as
+its license requires.
 
 **No live subway data.** SEPTA's real-time JSON API reports trolley and M1 positions and
 delays (TransitView), but nothing for the L1 or the Broad Street Line; its GTFS-realtime
@@ -197,6 +214,8 @@ For local use only, point a desktop MCP client at the stdio command instead:
 | `SEPTA_GTFS_URLS` | SEPTA, then GitHub | Comma-separated download URLs |
 | `SEPTA_GTFS_MAX_AGE_HOURS` | `168` (a week) | Re-download the timetables when the cache is older than this |
 | `SEPTA_API_BASE` | `https://www3.septa.org/api` | Real-time API base (point at the mock for offline dev) |
+| `SEPTA_GEOCODER_URL` | `https://nominatim.openstreetmap.org/search` | Nominatim-compatible place search |
+| `SEPTA_GEOCODER_EMAIL` | — | Contact address sent to the geocoder, which Nominatim asks heavier users for |
 | `SEPTA_API_TIMEOUT` | `10` | Seconds per real-time request |
 | `SEPTA_API_CACHE_SECONDS` | `10` | How long identical real-time requests share a response |
 | `SEPTA_API_MAX_PER_MINUTE` | `60` | Most real-time requests sent to SEPTA in any 60 seconds (per process) |
