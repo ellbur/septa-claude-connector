@@ -1,0 +1,29 @@
+# Redeploys the Cloud Run service and its timetable-refresh job from a Cloud Build trigger
+# on pushes to the deploy branch (see "Deploy from GitHub" in README.md). Run deploy.sh once
+# first: it creates the bucket, the job and the scheduler, which this only points at the new
+# image, keeping their other settings.
+substitutions:
+  _REGION: us-east4
+  _SERVICE: septa-mcp
+  _JOB: septa-mcp-refresh
+  # The repository deploy.sh's source deploys push to.
+  _IMAGE: ${_REGION}-docker.pkg.dev/${PROJECT_ID}/cloud-run-source-deploy/${_SERVICE}:${BUILD_ID}
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: [build, -t, $_IMAGE, .]
+  - name: gcr.io/cloud-builders/docker
+    args: [push, $_IMAGE]
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args: [run, deploy, $_SERVICE, --image, $_IMAGE, --region, $_REGION, --quiet]
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args: [run, jobs, update, $_JOB, --image, $_IMAGE, --region, $_REGION, --quiet]
+
+images: [$_IMAGE]
+
+options:
+  dynamicSubstitutions: true
+  # Required when the trigger runs as a chosen service account.
+  logging: CLOUD_LOGGING_ONLY
