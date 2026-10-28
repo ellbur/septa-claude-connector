@@ -834,7 +834,8 @@ async def metro_departures(stop: str, line: str | None = None, count: int = 10) 
     name is shared. Trolleys and the M1 report live delays (status, expected). The subway
     lines (L1, B1-B3) don't, and their times are approximate: each subway direction gets at
     least three times with minutes_after_previous, and subway_frequency says how often
-    trains run; tell the rider both rather than one exact time.
+    trains run; tell the rider both rather than one exact time. At a busy stop the subway
+    times are cut to one or two per direction (subway_trimmed); pass line for more.
     """
     try:
         codes = _line_codes(line)
@@ -896,14 +897,14 @@ async def metro_departures(stop: str, line: str | None = None, count: int = 10) 
             d = {"summary": f"{summary} ({d['status']}).", **d}
         out.append((expected, d, trip, key))
     out.sort(key=lambda x: x[0])
-    shown = out[:count]
-    # At least a few times per subway line and direction, to show how often trains come.
-    for key in dict.fromkeys(k for _, _, t, k in out if feed.line(t.route_id).approximate):
-        missing = metro.SUBWAY_MIN_TIMES - sum(1 for x in shown if x[3] == key)
-        if missing > 0:
-            shown += [x for x in out[count:] if x[3] == key][:missing]
-    shown.sort(key=lambda x: x[0])
+    shown, per_direction = _departure_board(feed, out, count)
     result["departures"] = [d for _, d, _, _ in shown]
+    if per_direction:
+        result["subway_trimmed"] = (
+            f"Busy stop: only the next {per_direction} subway train{'s' if per_direction > 1 else ''} per line "
+            "and direction are listed. minutes_after_previous is still the gap to the train before, "
+            "which may not be listed. For more subway times, call again with line (e.g. \"L1\")."
+        )
     freqs = []
     for key in dict.fromkeys(k for _, _, t, k in shown if feed.line(t.route_id).approximate):
         expected, _, trip, _ = next(x for x in shown if x[3] == key)
@@ -919,6 +920,41 @@ async def metro_departures(stop: str, line: str | None = None, count: int = 10) 
     if vs and ve and not (vs <= current.date() <= ve):
         result["warning"] = f"Today is outside the published Metro schedule ({vs.isoformat()} to {ve.isoformat()})."
     return result
+
+
+# A departure board longer than this (or than the count asked for, if more) gets fewer
+# subway times per line and direction.
+BOARD_LIMIT = 12
+
+
+def _departure_board(feed, out: list, count: int) -> tuple[list, int | None]:
+    """The departures to list from out (sorted (expected, entry, trip, (line, direction))
+    tuples), and how many subway times per direction it was cut to (None if not cut).
+
+    Normally that's the first count, plus later subway trains until each subway line and
+    direction has SUBWAY_MIN_TIMES, to show how often they come. At a busy stop that can
+    triple the board (15th St/City Hall has six subway directions), so past BOARD_LIMIT
+    subway directions are cut to 2 times each, then to 1: a time and its gap to the train
+    before still say how often trains come.
+    """
+    def is_subway(x) -> bool:
+        return feed.line(x[2].route_id).approximate
+
+    directions = list(dict.fromkeys(x[3] for x in out if is_subway(x)))
+    shown = out[:count]
+    for key in directions:
+        missing = metro.SUBWAY_MIN_TIMES - sum(1 for x in shown if x[3] == key)
+        if missing > 0:
+            shown += [x for x in out[count:] if x[3] == key][:missing]
+    limit = max(count, BOARD_LIMIT)
+    per_direction = None
+    for n in (2, 1):
+        if len(shown) <= limit:
+            break
+        others = [x for x in out[:count] if not is_subway(x)]
+        shown = others + [x for key in directions for x in [y for y in out if y[3] == key][:n]]
+        per_direction = n
+    return sorted(shown, key=lambda x: x[0]), per_direction
 
 
 def _already_passed(vehicle: dict, stop_sequence: int) -> bool:

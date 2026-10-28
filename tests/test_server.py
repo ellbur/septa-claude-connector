@@ -611,13 +611,50 @@ def test_subway_departures_show_a_few_per_direction(monkeypatch):
     day = next_weekday(2)
     monkeypatch.setattr(server, "now", lambda: datetime.combine(day, dtime(8, 0), server.TZ))
     monkeypatch.setattr(realtime, "transit_view", lambda route, now=None: [])
-    r = call("metro_departures", {"stop": "15th St", "count": 2})
+    r = call("metro_departures", {"stop": "Frankford Transit Center", "count": 2})
+    assert "subway_trimmed" not in r
     l1 = [d for d in r["departures"] if d["line"] == "L1"]
-    for toward in ("69th St Transit Center", "Frankford Transit Center"):
-        assert sum(d["toward"] == toward for d in l1) >= metro.SUBWAY_MIN_TIMES
+    assert len(r["departures"]) >= metro.SUBWAY_MIN_TIMES > 2  # more than the 2 asked for
+    assert all(d["toward"] == "69th St Transit Center" for d in l1) and len(l1) >= metro.SUBWAY_MIN_TIMES
     assert all(d["minutes_after_previous"] > 0 for d in l1)
-    assert {(f["line"], f["toward"]) for f in r["subway_frequency"]} >= {
-        ("L1", "69th St Transit Center"), ("L1", "Frankford Transit Center")}
+    assert {f["line"] for f in r["subway_frequency"]} == {"L1"}
+
+
+def test_busy_departure_board_trims_subway_times(monkeypatch):
+    day = next_weekday(2)
+    monkeypatch.setattr(server, "now", lambda: datetime.combine(day, dtime(8, 0), server.TZ))
+    monkeypatch.setattr(realtime, "transit_view", lambda route, now=None: [])
+    # Six subway directions (L1, B1, B2, each way) at 15th St/City Hall, plus the trolleys.
+    r = call("metro_departures", {"stop": "15th St", "count": 10})
+    assert len(r["departures"]) <= server.BOARD_LIMIT
+    subway = [d for d in r["departures"] if d["line"] in ("L1", "B1", "B2")]
+    directions = {(d["line"], d["toward"]) for d in subway}
+    assert {("L1", "69th St Transit Center"), ("L1", "Frankford Transit Center")} <= directions
+    assert len(subway) == len(directions)  # cut to one time each...
+    assert all(d["minutes_after_previous"] > 0 for d in subway)  # ...with its gap to the one before
+    assert "only the next 1 subway train per line" in r["subway_trimmed"]
+    assert len(r["subway_frequency"]) == len(directions)
+
+    # Asking for one line shows a few of its times again.
+    r = call("metro_departures", {"stop": "15th St", "line": "L1", "count": 10})
+    assert "subway_trimmed" not in r and len(r["departures"]) == 10
+
+
+def test_departure_board_trims_to_two_before_one():
+    feed = metro_feed()
+    t0 = datetime(2026, 11, 4, 8, 0, tzinfo=server.TZ)
+    l1 = next(t for t in feed.trips.values() if t.route_id == "L1")
+    t1 = next(t for t in feed.trips.values() if t.route_id == "T1")
+    out = [(t0 + timedelta(minutes=m), {}, l1, ("L1", str(d))) for d in range(5) for m in range(0, 30, 6)]
+    out += [(t0 + timedelta(minutes=m, seconds=1), {}, t1, ("T1", "0")) for m in range(5)]
+    out.sort(key=lambda x: x[0])
+    # The first 4 are subway; topping each of 5 directions up to 3 makes 15 > BOARD_LIMIT,
+    # and 2 each makes 10.
+    shown, per_direction = server._departure_board(feed, out, 4)
+    assert per_direction == 2 and len(shown) == 10
+    assert all(sum(x[3] == ("L1", str(d)) for x in shown) == 2 for d in range(5))
+    # Asked for more than the limit: nothing is cut.
+    assert server._departure_board(feed, out, 20)[1] is None
 
 
 def test_frequency_summary():

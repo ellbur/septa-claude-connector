@@ -82,7 +82,10 @@ feed has no real subway data either. And riders can't count on a subway train's 
 only on how often trains come. So subway results always include at least three times per
 line and direction (even past the requested window), each with `minutes_after_previous`,
 plus `subway_frequency` ("L1 toward Frankford Transit Center runs about every 6 min around
-8:02 AM"), and Claude is told to present them as approximate.
+8:02 AM"), and Claude is told to present them as approximate. At a busy stop that would
+swamp the departure board (15th St/City Hall has six subway directions), so past 12 entries
+the board cuts subway directions to two times each, then one; each keeps its gap to the
+train before, and the result says to ask for one line to see more.
 
 ## Run it
 
