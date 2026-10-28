@@ -175,6 +175,16 @@ its next request, so downloading and processing never hold up a rider's question
 service only downloads them itself if the job hasn't succeeded in 8 days, or the cached
 timetable has run out. To refresh now: `gcloud run jobs execute septa-mcp-refresh --region us-east4`.
 
+To deploy from GitHub instead, `.github/workflows/deploy.yml` runs `deploy.sh` on every push
+to the `deploy` branch. It signs in through Workload Identity Federation, so no key is
+stored. Set it up once, as a project owner (Cloud Shell works), then set the repository
+variables it prints:
+
+```bash
+PROJECT=my-gcp-project ./setup-github-deploy.sh
+git push origin HEAD:deploy
+```
+
 The service gets 1 GiB of memory: with every feed loaded, and the next schedule too in the
 days before it starts, the server uses up to ~350 MB, and processing a download briefly
 adds ~170 MB more.
