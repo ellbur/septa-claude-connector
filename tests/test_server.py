@@ -12,7 +12,7 @@ import json
 import os
 import sys
 import zipfile
-from datetime import date, datetime, time as dtime
+from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 
 import anyio
@@ -494,7 +494,7 @@ def test_metro_departures_with_live_delays(monkeypatch):
     deps = r["departures"]
     t3 = [d for d in deps if d["line"] == "T3"]
     assert t3 and all(d["status"] == "3 min late" and d["expected"] for d in t3)
-    assert any(d["line"] == "L1" and d["status"].startswith("scheduled (no live data") for d in deps)
+    assert any(d["line"] == "L1" and d["status"] == "approximate (no live subway data)" for d in deps)
     assert all(d["status"] == "scheduled" for d in deps if d["line"] in ("T1", "T2"))
     assert "warning" not in r
 
@@ -569,3 +569,63 @@ def test_gtfs_subset_keeps_only_metro_routes():
         assert ids("stop_times.txt", 0) == ["t1"]
         assert ids("stops.txt", 0) == ["p1", "st"]  # the platform's parent station too
         assert "calendar.txt" in out.namelist()
+
+
+def test_subway_times_come_with_how_often_trains_run():
+    # A five-minute window still gets a few L1 trains, each with the gap before it.
+    r = call("metro_schedule", {
+        "from_stop": "15th St", "to_stop": "Frankford Transit Center", "date": next_weekday(2).isoformat(),
+        "depart_after": "08:00", "depart_before": "08:05",
+    })
+    assert len(r["trips"]) >= metro.SUBWAY_MIN_TIMES
+    for t in r["trips"]:
+        assert 1 <= t["minutes_after_previous"] <= 15  # including the first, from the train before 8:00
+        assert t["summary"].endswith(f"(approximate; {t['minutes_after_previous']} min after the previous train).")
+    (freq,) = r["subway_frequency"]
+    assert freq["line"] == "L1" and 3 <= freq["every_min"] <= 12
+    assert freq["summary"].startswith(f"L1 (Market-Frankford Line) toward Frankford Transit Center runs about every {freq['every_min']} min")
+    assert "approximate" in r["subway_note"]
+
+
+def test_trolley_times_stay_exact():
+    r = call("metro_schedule", {
+        "from_stop": "15th St", "to_stop": "30th St", "date": next_weekday(2).isoformat(),
+        "depart_after": "08:00", "depart_before": "08:10", "line": "T",
+    })
+    assert r["trips"] and not any("minutes_after_previous" in t or "approximate" in t["summary"] for t in r["trips"])
+    assert "subway_frequency" not in r and "subway_note" not in r
+
+
+def test_subway_transfer_legs_say_how_often_trains_run():
+    r = call("metro_schedule", {
+        "from_stop": "Erie", "to_stop": "2nd St", "date": next_weekday(2).isoformat(),
+        "depart_after": "08:00", "depart_before": "08:30",
+    })
+    it = r["itineraries"][0]
+    assert all(leg["runs_every_min"] > 0 for leg in it["legs"])
+    assert f"The L1 (Market-Frankford Line) runs about every {it['legs'][1]['runs_every_min']} min then." in it["summary"]
+    assert "subway_note" in r
+
+
+def test_subway_departures_show_a_few_per_direction(monkeypatch):
+    day = next_weekday(2)
+    monkeypatch.setattr(server, "now", lambda: datetime.combine(day, dtime(8, 0), server.TZ))
+    monkeypatch.setattr(realtime, "transit_view", lambda route, now=None: [])
+    r = call("metro_departures", {"stop": "15th St", "count": 2})
+    l1 = [d for d in r["departures"] if d["line"] == "L1"]
+    for toward in ("69th St Transit Center", "Frankford Transit Center"):
+        assert sum(d["toward"] == toward for d in l1) >= metro.SUBWAY_MIN_TIMES
+    assert all(d["minutes_after_previous"] > 0 for d in l1)
+    assert {(f["line"], f["toward"]) for f in r["subway_frequency"]} >= {
+        ("L1", "69th St Transit Center"), ("L1", "Frankford Transit Center")}
+
+
+def test_frequency_summary():
+    t0 = datetime(2026, 11, 4, 8, 0, tzinfo=server.TZ)
+    times = [t0 + timedelta(minutes=m) for m in (0, 5, 12, 18, 24)]
+    f = metro.frequency(metro.LINES["B1"], "NRG", times, t0)
+    assert (f["every_min"], f["gaps_min"]) == (6, "5-7")
+    assert f["summary"] == "B1 (Broad Street Line local) toward NRG runs about every 6 min around 8:00 AM (gaps of 5-7 min)."
+    even = metro.frequency(metro.LINES["L1"], "Frankford", [t0, t0 + timedelta(minutes=6)], t0)
+    assert even["summary"].endswith("runs about every 6 min around 8:00 AM.")
+    assert metro.frequency(metro.LINES["L1"], "Frankford", [t0], t0) is None

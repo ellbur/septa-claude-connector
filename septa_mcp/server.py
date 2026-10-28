@@ -50,6 +50,11 @@ Spur), the trolleys (T1-T5, G1, D1, D2) and the M1 Norristown High Speed Line.
 - Metro trips are identified by line and toward (the direction's last stop). Riders often
   use older names, which work as line names too: "MFL"/"the El" = L1, "BSL" = B1-B3,
   "Route 10" = T1, "Route 15" = G1, "Route 101" = D1, "NHSL" = M1.
+- Subway (L1, B1-B3) times are approximate: there's no live subway data, and what riders
+  can count on is how often trains come, not the minute one leaves. Results always include
+  a few subway times with minutes_after_previous, plus subway_frequency. When giving subway
+  times, say they're approximate and roughly how often trains run then ("L1 trains every
+  6-8 minutes; one is scheduled at 8:04").
 - No tool plans a trip mixing Regional Rail and Metro. Plan each part and change at a hub:
   Suburban Station <-> 15th St/City Hall, Gray 30th St Station <-> Drexel Station at
   30th St, Jefferson Station <-> 13th St or 8th-Market (short walks), Fern Rock and
@@ -685,6 +690,10 @@ async def metro_schedule(
     trip it returns one-transfer itineraries, including short walks between nearby stations
     (walk_to). Doesn't combine Metro with Regional Rail. For the next departures with live
     delays, use metro_departures.
+
+    Subway (L1, B1-B3) times are approximate. Each subway line gets at least three times,
+    even past depart_before, with minutes_after_previous, and subway_frequency says how
+    often trains run; tell the rider both rather than one exact time.
     """
     return await anyio.to_thread.run_sync(
         lambda: _metro_schedule(from_stop, to_stop, date, depart_after, depart_before, line, max_results)
@@ -710,27 +719,76 @@ def _metro_schedule(from_stop, to_stop, date, depart_after, depart_before, line,
 
     ws, we = _window(day, after, before)
     result = _schedule_header(feed, origin, dest, day, ws, we)
-    rides = feed.direct_rides(origin, dest, ws, we)
+    # Subway results also use the trains just before the window (for the gap to the first
+    # one) and after it (to show at least a few).
+    nearby = feed.direct_rides(origin, dest, ws - metro.HEADWAY_SPAN, we + timedelta(hours=2))
     if codes:
-        on_line = [r for r in rides if r.board_trip.route_id in codes]
-        if rides and not on_line:
+        on_line = [r for r in nearby if r.board_trip.route_id in codes]
+        if not on_line and any(ws <= r.depart_dt <= we for r in nearby):
             result["note"] = f"No {line} trips between these stops in this window; these are on other lines."
-        rides = on_line or rides
-    if rides:
-        result["trips"] = [metro.ride_to_dict(feed, r, day) for r in rides[:max_results]]
-        if len(rides) > max_results:
-            result["more_available"] = len(rides) - max_results
+        nearby = on_line or nearby
+    rides = [r for r in nearby if ws <= r.depart_dt <= we]
+    shown = _with_subway_minimum(feed, rides[:max_results], nearby, ws)
+    if shown:
+        result["trips"] = [_metro_trip(feed, r, nearby, day) for r in shown]
+        more = len(rides) - sum(1 for r in shown if ws <= r.depart_dt <= we)
+        if more > 0:
+            result["more_available"] = more
+        result.update(_subway_frequency(feed, shown, nearby))
     else:
         journeys = feed.transfer_journeys(origin, dest, ws, we)
         if journeys:
             result["note"] = "No direct trips; these itineraries need one transfer."
             result["itineraries"] = [_metro_itinerary(feed, l1, l2, day) for l1, l2 in journeys[:max_results]]
+            if any(feed.line(leg.board_trip.route_id).approximate for j in journeys[:max_results] for leg in j):
+                result["subway_note"] = metro.SUBWAY_NOTE
         else:
             result["trips"] = []
             result["note"] = "No scheduled service between these stops in this window."
             result.update(_metro_alerts(origin, dest))
     result["schedule_source"] = feed.summary()
     return result
+
+
+def _with_subway_minimum(feed, shown: list, nearby: list, ws: datetime) -> list:
+    """shown, plus the next trains on each subway line in nearby until it has
+    SUBWAY_MIN_TIMES, even past the end of the window."""
+    out = list(shown)
+    have = {id(r) for r in out}
+    for code in {r.board_trip.route_id for r in nearby if feed.line(r.board_trip.route_id).approximate}:
+        missing = metro.SUBWAY_MIN_TIMES - sum(1 for r in out if r.board_trip.route_id == code)
+        later = [r for r in nearby if r.board_trip.route_id == code and r.depart_dt >= ws and id(r) not in have]
+        out += later[:max(0, missing)]
+    return sorted(out, key=lambda r: (r.depart_dt, r.arrive_dt))
+
+
+def _metro_trip(feed, r, nearby: list, day: date) -> dict:
+    d = metro.ride_to_dict(feed, r, day)
+    if feed.line(r.board_trip.route_id).approximate:
+        before = [p for p in nearby if p.board_trip.route_id == r.board_trip.route_id and p.depart_dt < r.depart_dt]
+        metro.mark_approximate(d, metro.gap_minutes(before[-1].depart_dt, r.depart_dt) if before else None)
+    return d
+
+
+def _subway_frequency(feed, shown: list, nearby: list) -> dict:
+    """subway_frequency for each subway line in shown, around its first train there, from
+    the trains in nearby (all of which reach the rider's stop)."""
+    freqs = []
+    for code in dict.fromkeys(r.board_trip.route_id for r in shown):
+        line_ = feed.line(code)
+        if not line_.approximate:
+            continue
+        first = next(r for r in shown if r.board_trip.route_id == code)
+        times = [
+            r.depart_dt for r in nearby
+            if r.board_trip.route_id == code and abs(r.depart_dt - first.depart_dt) <= metro.HEADWAY_SPAN
+        ]
+        f = metro.frequency(line_, feed.toward(first.board_trip), times, first.depart_dt)
+        if f:
+            freqs.append(f)
+    if not any(feed.line(r.board_trip.route_id).approximate for r in shown):
+        return {}
+    return {"subway_frequency": freqs, "subway_note": metro.SUBWAY_NOTE}
 
 
 def _metro_itinerary(feed, l1, l2, day: date) -> dict:
@@ -740,11 +798,19 @@ def _metro_itinerary(feed, l1, l2, day: date) -> dict:
     change = f"change at {a['get_off_at']}"
     if walk is not None:
         change += f", walk to {b['board_at']} (about {walk} min),"
+    how_often = ""
+    for ride, leg in ((l1, a), (l2, b)):
+        if feed.line(ride.board_trip.route_id).approximate:
+            f = feed.frequency(feed.stops[ride.board.stop_id], ride.board_trip, ride.depart_dt)
+            metro.mark_approximate(leg, None)
+            if f:
+                leg["runs_every_min"] = f["every_min"]
+                how_often += f" The {leg['line_label']} runs about every {f['every_min']} min then."
     out = {
         "summary": (
             f"Take the {a['line_label']} toward {a['toward']} from {a['board_at']} at {a['depart']}, "
             f"{change} and take the {b['line_label']} toward {b['toward']} at {b['depart']} "
-            f"({wait} min after arriving), arrive at {b['get_off_at']} at {b['arrive']}."
+            f"({wait} min after arriving), arrive at {b['get_off_at']} at {b['arrive']}.{how_often}"
         ),
         "depart": a["depart"],
         "arrive": b["arrive"],
@@ -765,8 +831,10 @@ async def metro_departures(stop: str, line: str | None = None, count: int = 10) 
     SEPTA reports them.
 
     line: only this line ("L1", "T3", "Route 15"...); also picks the right stop when a
-    name is shared. Trolleys and the M1 report live delays (status, estimated); the
-    subway lines (L1, B1-B3) don't, so their times are scheduled.
+    name is shared. Trolleys and the M1 report live delays (status, expected). The subway
+    lines (L1, B1-B3) don't, and their times are approximate: each subway direction gets at
+    least three times with minutes_after_previous, and subway_frequency says how often
+    trains run; tell the rider both rather than one exact time.
     """
     try:
         codes = _line_codes(line)
@@ -797,7 +865,10 @@ async def metro_departures(stop: str, line: str | None = None, count: int = 10) 
             break
 
     out = []
+    previous: dict[tuple[str, str], datetime] = {}  # (line, direction) -> last departure
     for sched, trip, i in deps:
+        key = (trip.route_id, trip.direction_id)
+        before, previous[key] = previous.get(key), sched
         v = vehicles.get(trip.trip_id)
         if v and _already_passed(v, trip.times[i].seq):
             continue
@@ -812,14 +883,35 @@ async def metro_departures(stop: str, line: str | None = None, count: int = 10) 
             if late:
                 d["expected"] = fmt_time(expected)
             d["vehicle"] = v["vehicle"]
+        elif line_.approximate:
+            d["status"] = "approximate (no live subway data)"
         else:
-            d["status"] = "scheduled" if line_.live else "scheduled (no live data for the subway)"
+            d["status"] = "scheduled"
         summary = f"{line_.label} toward {d['toward']} leaves at {d['scheduled']}"
         if "expected" in d:
             summary += f", expected {d['expected']}"
-        out.append((expected, {"summary": f"{summary} ({d['status']}).", **d}))
+        if line_.approximate:
+            d = metro.mark_approximate({"summary": f"{summary}.", **d}, metro.gap_minutes(before, sched) if before else None)
+        else:
+            d = {"summary": f"{summary} ({d['status']}).", **d}
+        out.append((expected, d, trip, key))
     out.sort(key=lambda x: x[0])
-    result["departures"] = [d for _, d in out[:count]]
+    shown = out[:count]
+    # At least a few times per subway line and direction, to show how often trains come.
+    for key in dict.fromkeys(k for _, _, t, k in out if feed.line(t.route_id).approximate):
+        missing = metro.SUBWAY_MIN_TIMES - sum(1 for x in shown if x[3] == key)
+        if missing > 0:
+            shown += [x for x in out[count:] if x[3] == key][:missing]
+    shown.sort(key=lambda x: x[0])
+    result["departures"] = [d for _, d, _, _ in shown]
+    freqs = []
+    for key in dict.fromkeys(k for _, _, t, k in shown if feed.line(t.route_id).approximate):
+        expected, _, trip, _ = next(x for x in shown if x[3] == key)
+        if f := feed.frequency(st, trip, expected):
+            freqs.append(f)
+    if any(feed.line(t.route_id).approximate for _, _, t, _ in shown):
+        result["subway_frequency"] = freqs
+        result["subway_note"] = metro.SUBWAY_NOTE
     if not result["departures"]:
         result["note"] = "No departures from this stop in the next six hours."
         result.update(await anyio.to_thread.run_sync(_metro_alerts, st))

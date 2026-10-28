@@ -77,8 +77,12 @@ links stations within a short walk of each other (Girard Av & Front St on the G1
 Front-Girard on the L1) so itineraries can include the walk.
 
 **No live subway data.** SEPTA's real-time JSON API reports trolley and M1 positions and
-delays (TransitView), but nothing for the L1 or the Broad Street Line, so subway departures
-are marked as scheduled times.
+delays (TransitView), but nothing for the L1 or the Broad Street Line; its GTFS-realtime
+feed has no real subway data either. And riders can't count on a subway train's minute,
+only on how often trains come. So subway results always include at least three times per
+line and direction (even past the requested window), each with `minutes_after_previous`,
+plus `subway_frequency` ("L1 toward Frankford Transit Center runs about every 6 min around
+8:02 AM"), and Claude is told to present them as approximate.
 
 ## Run it
 

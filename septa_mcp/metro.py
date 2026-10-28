@@ -21,8 +21,9 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from itertools import combinations
+from statistics import median
 
-from .gtfs import RailFeed, Ride, Stop, Trip, _to_dt, fmt_time_on
+from .gtfs import RailFeed, Ride, Stop, Trip, _to_dt, fmt_time, fmt_time_on
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,12 @@ class Line:
     formerly: str | None = None  # route number before SEPTA's Metro letter names
     alert_ids: tuple[str, ...] = ()  # route_ids the alerts feed files it under
     live: bool = True  # vehicles report positions to the TransitView API
+
+    @property
+    def approximate(self) -> bool:
+        """Subway times are only a guide: there's no live data, and what riders can count
+        on is how often trains come, not the minute a given one leaves."""
+        return self.mode == "subway"
 
     @property
     def label(self) -> str:
@@ -158,6 +165,18 @@ SAME_STATION_METERS = 400  # same-named stops this close are one station
 WALK_METERS = 200  # stations this close are a walkable transfer
 
 
+# Every result shows at least this many times per subway line and direction, so the
+# model can tell riders how often trains come.
+SUBWAY_MIN_TIMES = 3
+# How far either side of a time to look when working out how often trains run.
+HEADWAY_SPAN = timedelta(minutes=30)
+SUBWAY_NOTE = (
+    "Subway (L1, B1-B3) times are approximate: there is no live subway data and trains don't "
+    "keep to the minute. Tell the rider the times are approximate and roughly how often trains "
+    "run then (subway_frequency), rather than presenting one train's time as exact."
+)
+
+
 def _platform_name(name: str) -> str:
     return _PLATFORM_SUFFIX.sub("", name).strip()
 
@@ -280,6 +299,52 @@ class MetroFeed(RailFeed):
 
     def toward(self, trip: Trip) -> str:
         return trip.headsign or (self.stops[trip.times[-1].stop_id].name if trip.times else "")
+
+    def frequency(self, station: Stop, trip: Trip, around: datetime) -> dict | None:
+        """How often trains on trip's line and direction leave station around a time."""
+        same = [
+            (dt, t) for dt, t, _ in self.departures(station, around - HEADWAY_SPAN, around + HEADWAY_SPAN)
+            if t.route_id == trip.route_id and t.direction_id == trip.direction_id
+        ]
+        toward = Counter(self.toward(t) for _, t in same).most_common(1)[0][0] if same else self.toward(trip)
+        return frequency(self.line(trip.route_id), toward, [dt for dt, _ in same], around)
+
+
+def gap_minutes(a: datetime, b: datetime) -> int:
+    return round((b - a).total_seconds() / 60)
+
+
+def frequency(line: Line, toward: str, times: list[datetime], around: datetime) -> dict | None:
+    """{"every_min": typical gap, "gaps_min": "5-8", "summary": ...} for trains leaving at
+    times, or None with fewer than two."""
+    times = sorted(times)
+    gaps = [g for g in (gap_minutes(a, b) for a, b in zip(times, times[1:])) if g > 0]
+    if not gaps:
+        return None
+    every = round(median(gaps))
+    spread = f"{min(gaps)}-{max(gaps)}" if min(gaps) != max(gaps) else str(every)
+    summary = f"{line.label} toward {toward} runs about every {every} min around {fmt_time(around)}"
+    if min(gaps) != max(gaps):
+        summary += f" (gaps of {spread} min)"
+    return {
+        "summary": summary + ".",
+        "line": line.code,
+        "toward": toward,
+        "around": fmt_time(around),
+        "every_min": every,
+        "gaps_min": spread,
+    }
+
+
+def mark_approximate(d: dict, after_previous: int | None) -> dict:
+    """Flag a subway trip as approximate, with the minutes since the train before it."""
+    if after_previous is not None:
+        d["minutes_after_previous"] = after_previous
+    d["summary"] = d["summary"].rstrip(".") + (
+        f" (approximate; {after_previous} min after the previous train)." if after_previous is not None
+        else " (approximate)."
+    )
+    return d
 
 
 def ride_summary(t: dict) -> str:
