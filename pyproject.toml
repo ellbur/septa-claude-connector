@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "septa-mcp"
 version = "0.1.0"
-description = "MCP connector for SEPTA Regional Rail: GTFS schedules plus real-time train status"
+description = "MCP connector for SEPTA Regional Rail, Metro and buses: GTFS schedules plus real-time status"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

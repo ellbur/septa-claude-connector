@@ -79,9 +79,87 @@ ALERTS = [
     {"route_id": "rr_route_mfo", "route_name": "Market Frankford Owl", "current_message": None,
      "advisory_message": "<p>Owl buses replace trains overnight.</p>", "detour_message": None,
      "last_updated": ""},
-    {"route_id": "bus_route_42", "route_name": "42", "current_message": "Detour",
-     "advisory_message": "", "detour_message": "", "last_updated": ""},
+    {"route_id": "bus_route_42", "route_name": "42", "current_message": None,
+     "advisory_message": "", "detour_message": "EB via Spruce St, Left on 38th St, Reg Rt",
+     "detour_start_location": "Spruce & 38th", "detour_start_date_time": "10/26/2026   7:41 AM",
+     "detour_end_date_time": "10/30/2026   4:00 PM", "detour_reason": "Road Work", "last_updated": ""},
+    {"route_id": "trolley_route_10", "route_name": "10", "current_message": None,
+     "advisory_message": "<p>Buses replace T1 trolleys west of 40th St this weekend.</p>",
+     "detour_message": None, "last_updated": ""},
+    {"route_id": "trolley_route_13", "route_name": "13", "current_message": None,
+     "advisory_message": None, "detour_message": None, "last_updated": ""},
+    {"route_id": "APP", "route_name": "Mobile APP", "current_message": "Update the app",
+     "advisory_message": None, "detour_message": None, "last_updated": ""},
 ]
+
+
+BUS_42 = [
+    {"lat": "39.95265", "lng": "-75.20951", "label": "3677", "VehicleID": "3677", "route_id": "42",
+     "trip": "880000", "BlockID": "4201", "Direction": "Westbound", "destination": "Wycombe", "heading": 270,
+     "late": 6, "next_stop_id": "10266", "next_stop_name": None, "next_stop_sequence": 12,
+     "estimated_seat_availability": "FEW_SEATS_AVAILABLE", "Offset": 6, "Offset_sec": "360"},
+]
+
+
+def transit_view(q):
+    """TransitView: vehicles on a bus/trolley route. Subway routes come back empty."""
+    now = int(datetime.now().timestamp())
+    if q.get("route") == ["42"]:
+        return {"bus": [{**v, "timestamp": now - 20} for v in BUS_42]}
+    if q.get("route") != ["T1"]:
+        return []
+    return {"bus": [
+        {"lat": "39.976337", "lng": "-75.236602", "label": "9024", "route_id": "T1", "trip": "968292",
+         "VehicleID": "9024", "BlockID": "9551", "Direction": "Eastbound", "destination": "13th St",
+         "heading": 81.36, "late": 3, "next_stop_id": "20611", "next_stop_name": None,
+         "next_stop_sequence": 3, "estimated_seat_availability": "MANY_SEATS_AVAILABLE", "Offset": 3,
+         "Offset_sec": "180", "timestamp": now - 30},
+        # No schedule estimate.
+        {"lat": "39.955208", "lng": "-75.19216", "label": "9084", "route_id": "T1", "trip": "968269",
+         "VehicleID": "9084", "BlockID": "9552", "Direction": "Westbound", "destination": "63rd-Malvern",
+         "heading": 113.18, "late": 998, "next_stop_id": None, "next_stop_name": "Lancaster Av & 40th St",
+         "next_stop_sequence": None, "estimated_seat_availability": "NOT_AVAILABLE", "Offset": 998,
+         "Offset_sec": "0", "timestamp": now - 60},
+        # Hasn't reported for an hour: parked, but still listed.
+        {"lat": "39.96", "lng": "-75.25", "label": "9001", "route_id": "T1", "trip": "968000",
+         "VehicleID": "9001", "BlockID": "9550", "Direction": "Eastbound", "destination": "13th St",
+         "heading": 0, "late": 0, "next_stop_id": "20611", "next_stop_name": None, "next_stop_sequence": 1,
+         "estimated_seat_availability": "NOT_AVAILABLE", "Offset": 0, "Offset_sec": "0",
+         "timestamp": now - 3600},
+    ]}
+
+def _place(name, kind, category, lat, lon, bbox=None, **extra):
+    """One result as Nominatim's /search?format=jsonv2 gives it."""
+    s, n, w, e = bbox or (lat - 0.0005, lat + 0.0005, lon - 0.0005, lon + 0.0005)
+    return {"place_id": 1, "lat": str(lat), "lon": str(lon), "category": category, "type": kind,
+            "addresstype": kind, "name": name, "display_name": f"{name}, Philadelphia, Pennsylvania, United States",
+            "boundingbox": [str(s), str(n), str(w), str(e)], "importance": 0.5, **extra}
+
+
+def _square(lat, lon, d):
+    return {"type": "Polygon", "coordinates": [[[lon - d, lat - d], [lon + d, lat - d], [lon + d, lat + d],
+                                                [lon - d, lat + d], [lon - d, lat - d]]]}
+
+
+# Stand-in for a Nominatim geocoder (SEPTA_GEOCODER_URL), by lower-cased query.
+PLACES = {
+    "reading terminal market": [_place("Reading Terminal Market", "amenity", "amenity", 39.9533, -75.1590)],
+    "1500 market st": [_place("1500 Market Street", "building", "building", 39.9524, -75.1659)],
+    # A neighborhood the map has only as a point.
+    "fishtown": [_place("Fishtown", "neighbourhood", "place", 39.9718, -75.1340)],
+    # A borough with an outline (when asked for one), and a namesake elsewhere.
+    "media": [_place("Media", "town", "boundary", 39.9168, -75.3877, (39.908, 39.925, -75.397, -75.378)),
+              _place("Media Theatre", "amenity", "amenity", 39.9180, -75.3880)],
+}
+
+
+def geocoder(q):
+    hits = PLACES.get(q.get("q", [""])[0].strip().lower(), [])
+    if q.get("polygon_geojson") == ["1"]:
+        hits = [{**h, "geojson": _square(float(h["lat"]), float(h["lon"]), 0.008)} if h["category"] == "boundary"
+                else h for h in hits]
+    return hits[: int(q.get("limit", ["10"])[0])]
+
 
 ROUTES = {
     "/api/NextToArrive/index.php": next_to_arrive,
@@ -90,6 +168,13 @@ ROUTES = {
     "/api/RRSchedules/index.php": lambda q: RR_SCHEDULE if q.get("req1") == ["5317"] else BadRequest(
         f"An invalid parameter was used. No train found with train #{q.get('req1', [''])[0]}."),
     "/api/Alerts/get_alert_data.php": lambda q: ALERTS,
+    "/nominatim/search": geocoder,
+    "/api/TransitView/index.php": transit_view,
+    # Every route at once; the real one is ~300 KB.
+    "/api/TransitViewAll/index.php": lambda q: {"routes": [{
+        "42": transit_view({"route": ["42"]})["bus"],
+        "T1": transit_view({"route": ["T1"]})["bus"],
+    }]},
 }
 
 REQUESTS: list[tuple[str, dict]] = []

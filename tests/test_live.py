@@ -52,3 +52,14 @@ def test_live_endpoints_parse():
     assert realtime.rail_alerts(), "expected at least one Regional Rail advisory"
     board = realtime.arrivals("Suburban Station", 3)
     assert set(board) == {"northbound", "southbound"}
+
+
+def test_live_metro_endpoints_parse():
+    modes = {a["mode"] for a in realtime.alerts()}
+    assert {"regional_rail", "bus"} <= modes
+    vehicles = realtime.transit_view("G1")
+    assert isinstance(vehicles, list)
+    assert all(v["trip"] for v in vehicles)
+    assert realtime.transit_view("L1") == []  # still no live subway data?
+    by_route = realtime.transit_view_all()
+    assert len(by_route) > 50 and all(v["trip"] for vs in by_route.values() for v in vs[:1])

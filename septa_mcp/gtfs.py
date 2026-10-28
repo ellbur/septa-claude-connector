@@ -1,7 +1,9 @@
-"""Load SEPTA's Regional Rail GTFS feed and answer schedule questions from it.
+"""Load SEPTA's GTFS feeds and answer schedule questions from them.
 
 The rail feed is small (~150 stations, ~2,300 trips, ~35,000 stop times), so it is
-parsed straight into memory; only the downloaded zip is cached on disk.
+parsed straight into memory; only the downloaded zip is cached on disk. The Metro
+(subway and trolley) feed is cut out of SEPTA's much larger bus feed on download and
+handled the same way by metro.MetroFeed.
 
 SEPTA-specific wrinkle handled here: most Regional Rail trains "through-run" across
 Center City and change line names on the way (a West Trenton train becomes a
@@ -34,7 +36,7 @@ log = logging.getLogger(__name__)
 TZ = ZoneInfo("America/New_York")
 
 # Official URL first, GitHub release mirror second. Either may be a bundle
-# (gtfs_public.zip containing google_rail.zip) or the rail zip itself.
+# (gtfs_public.zip containing google_rail.zip and google_bus.zip) or the rail zip itself.
 DEFAULT_GTFS_URLS = [
     "https://www3.septa.org/developer/gtfs_public.zip",
     "https://github.com/septadev/GTFS/releases/latest/download/gtfs_public.zip",
@@ -42,13 +44,21 @@ DEFAULT_GTFS_URLS = [
 
 USER_AGENT = "septa-mcp/0.1 (+https://github.com/septadev/GTFS)"
 
+# GTFS route_types kept from the bus feed for the Metro: 0 = trolley/light rail,
+# 1 = subway (SEPTA files the Norristown High Speed Line there too).
+METRO_ROUTE_TYPES = {"0", "1"}
+
 
 class StationNotFound(ValueError):
-    def __init__(self, query: str, suggestions: list[str]):
+    def __init__(self, query: str, suggestions: list[str], what: str = "Regional Rail station"):
         self.query = query
         self.suggestions = suggestions
         hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
-        super().__init__(f"No Regional Rail station matches '{query}'.{hint}")
+        super().__init__(f"No {what} matches '{query}'.{hint}")
+
+
+class FeedUnavailable(RuntimeError):
+    pass
 
 
 class AmbiguousStation(ValueError):
@@ -193,6 +203,10 @@ _GROUPS = {
 }
 
 
+# Stops in the feed that riders can't use, kept out of name lookups.
+_HIDDEN_STOP = re.compile(r"not a stop|employees only", re.I)
+
+
 def normalize(name: str) -> str:
     s = name.lower().replace("&", " and ").replace("'", "")
     s = re.sub(r"[^a-z0-9 ]+", " ", s)
@@ -207,108 +221,28 @@ def normalize(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-class RailFeed:
-    def __init__(self, rail_zip: bytes, source: str = "", fetched_at: float | None = None):
+class ServiceCalendar:
+    """Which services run on a day, the dates a feed covers, and where it came from: the
+    parts every feed type (rail, Metro, bus) shares."""
+
+    def __init__(self, source: str = "", fetched_at: float | None = None):
         self.source = source
         self.fetched_at = fetched_at or time.time()
-        self.stops: dict[str, Stop] = {}
-        self.routes: dict[str, dict] = {}
-        self.trips: dict[str, Trip] = {}
         self.calendar: dict[str, dict] = {}
         self.cal_add: dict[str, set[date]] = {}
         self.cal_remove: dict[str, set[date]] = {}
-        self.next_trip: dict[str, str] = {}
-        self.prev_trip: dict[str, str] = {}
         self.feed_info: dict = {}
-        self._between_cache: dict[tuple[str, str], list[Stop]] = {}
-        self._load(rail_zip)
-        self._name_index = {normalize(s.name): s for s in self.stops.values()}
 
-    # -- loading -----------------------------------------------------------
-
-    def _load(self, rail_zip: bytes) -> None:
-        with zipfile.ZipFile(io.BytesIO(rail_zip)) as z:
-            names = set(z.namelist())
-
-            def rows(fname: str):
-                if fname not in names:
-                    return []
-                with z.open(fname) as fh:
-                    text = io.TextIOWrapper(fh, encoding="utf-8-sig", newline="")
-                    return list(csv.DictReader(text))
-
-            for r in rows("stops.txt"):
-                self.stops[r["stop_id"]] = Stop(
-                    r["stop_id"],
-                    r["stop_name"].strip(),
-                    float(r.get("stop_lat") or 0),
-                    float(r.get("stop_lon") or 0),
-                    r.get("wheelchair_boarding") == "1",
-                )
-            for r in rows("routes.txt"):
-                self.routes[r["route_id"]] = r
-            for r in rows("trips.txt"):
-                short = r.get("trip_short_name") or ""
-                digits = re.sub(r"\D", "", short) or r.get("block_id") or short
-                self.trips[r["trip_id"]] = Trip(
-                    r["trip_id"],
-                    r["route_id"],
-                    r["service_id"],
-                    r.get("trip_headsign", ""),
-                    digits,
-                    r.get("direction_id", ""),
-                )
-            for r in rows("stop_times.txt"):
-                t = self.trips.get(r["trip_id"])
-                if not t:
-                    continue
-                arr = r["arrival_time"] or r["departure_time"]
-                dep = r["departure_time"] or r["arrival_time"]
-                if not arr:
-                    continue
-                t.times.append(
-                    StopTime(
-                        r["stop_id"],
-                        int(r["stop_sequence"]),
-                        _parse_time(arr),
-                        _parse_time(dep),
-                        r.get("pickup_type", "") not in ("1",),
-                        r.get("drop_off_type", "") not in ("1",),
-                    )
-                )
-            for t in self.trips.values():
-                t.times.sort(key=lambda st: st.seq)
-                for st in t.times:
-                    if st.stop_id in self.stops:
-                        self.stops[st.stop_id].routes.add(t.route_id)
-
-            for r in rows("calendar.txt"):
-                self.calendar[r["service_id"]] = r
-            for r in rows("calendar_dates.txt"):
-                d = datetime.strptime(r["date"], "%Y%m%d").date()
-                target = self.cal_add if r["exception_type"] == "1" else self.cal_remove
-                target.setdefault(r["service_id"], set()).add(d)
-
-            for r in rows("transfers.txt"):
-                # transfer_type 4 = in-seat transfer: same physical train continues.
-                if r.get("transfer_type") == "4" and r.get("from_trip_id") and r.get("to_trip_id"):
-                    self.next_trip[r["from_trip_id"]] = r["to_trip_id"]
-                    self.prev_trip[r["to_trip_id"]] = r["from_trip_id"]
-
-            fi = rows("feed_info.txt")
-            self.feed_info = fi[0] if fi else {}
-
-        # Per-stop index of (trip, position) for fast lookups.
-        self.stop_index: dict[str, list[tuple[Trip, int]]] = {}
-        for t in self.trips.values():
-            for i, st in enumerate(t.times):
-                self.stop_index.setdefault(st.stop_id, []).append((t, i))
-
-    # -- metadata ----------------------------------------------------------
-
-    def route_name(self, route_id: str) -> str:
-        r = self.routes.get(route_id, {})
-        return r.get("route_long_name") or r.get("route_short_name") or route_id
+    def _read_calendar(self, rows) -> None:
+        """Load calendar.txt, calendar_dates.txt and feed_info.txt via rows(fname)."""
+        for r in rows("calendar.txt"):
+            self.calendar[r["service_id"]] = r
+        for r in rows("calendar_dates.txt"):
+            d = datetime.strptime(r["date"], "%Y%m%d").date()
+            target = self.cal_add if r["exception_type"] == "1" else self.cal_remove
+            target.setdefault(r["service_id"], set()).add(d)
+        fi = rows("feed_info.txt")
+        self.feed_info = fi[0] if fi else {}
 
     def feed_range(self) -> tuple[date | None, date | None]:
         def p(k):
@@ -352,10 +286,8 @@ class RailFeed:
             ),
         }
         if self.source.startswith("http"):
-            out["note"] += " The server checks SEPTA for newer feeds daily."
+            out["note"] += " The server checks SEPTA for newer feeds weekly."
         return out
-
-    # -- calendar ----------------------------------------------------------
 
     def services_on(self, d: date) -> set[str]:
         wd = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"][d.weekday()]
@@ -373,27 +305,141 @@ class RailFeed:
                 active.discard(sid)
         return active
 
+
+class RailFeed(ServiceCalendar):
+    # What resolve_station looks up (for error messages), and the names riders use for it.
+    KIND = "Regional Rail station"
+    ALIASES = _ALIASES
+    GROUPS = _GROUPS
+
+    def __init__(self, rail_zip: bytes, source: str = "", fetched_at: float | None = None):
+        super().__init__(source, fetched_at)
+        self.stops: dict[str, Stop] = {}
+        self.routes: dict[str, dict] = {}
+        self.trips: dict[str, Trip] = {}
+        self.next_trip: dict[str, str] = {}
+        self.prev_trip: dict[str, str] = {}
+        # Other stop_ids that resolve to a stop (e.g. a Metro station's platforms).
+        self.stop_alias: dict[str, str] = {}
+        # stop_id -> [(nearby stop_id, minutes to walk there)], for changing between lines.
+        self.walk_links: dict[str, list[tuple[str, int]]] = {}
+        self._between_cache: dict[tuple[str, str], list[Stop]] = {}
+        self._load(rail_zip)
+        self._name_index = {normalize(s.name): s for s in self.stops.values() if not _HIDDEN_STOP.search(s.name)}
+
+    # -- loading -----------------------------------------------------------
+
+    def _load(self, rail_zip: bytes) -> None:
+        with zipfile.ZipFile(io.BytesIO(rail_zip)) as z:
+            names = set(z.namelist())
+
+            def rows(fname: str):
+                if fname not in names:
+                    return []
+                with z.open(fname) as fh:
+                    text = io.TextIOWrapper(fh, encoding="utf-8-sig", newline="")
+                    return list(csv.DictReader(text))
+
+            parents = {}
+            for r in rows("stops.txt"):
+                if r.get("parent_station"):
+                    parents[r["stop_id"]] = r["parent_station"]
+                self.stops[r["stop_id"]] = Stop(
+                    r["stop_id"],
+                    r["stop_name"].strip(),
+                    float(r.get("stop_lat") or 0),
+                    float(r.get("stop_lon") or 0),
+                    r.get("wheelchair_boarding") == "1",
+                )
+            for r in rows("routes.txt"):
+                self.routes[r["route_id"]] = r
+            for r in rows("trips.txt"):
+                short = r.get("trip_short_name") or ""
+                digits = re.sub(r"\D", "", short) or r.get("block_id") or short
+                self.trips[r["trip_id"]] = Trip(
+                    r["trip_id"],
+                    r["route_id"],
+                    r["service_id"],
+                    r.get("trip_headsign", ""),
+                    digits,
+                    r.get("direction_id", ""),
+                )
+            for r in rows("stop_times.txt"):
+                t = self.trips.get(r["trip_id"])
+                if not t:
+                    continue
+                arr = r["arrival_time"] or r["departure_time"]
+                dep = r["departure_time"] or r["arrival_time"]
+                if not arr:
+                    continue
+                t.times.append(
+                    StopTime(
+                        r["stop_id"],
+                        int(r["stop_sequence"]),
+                        _parse_time(arr),
+                        _parse_time(dep),
+                        r.get("pickup_type", "") not in ("1",),
+                        r.get("drop_off_type", "") not in ("1",),
+                    )
+                )
+            for t in self.trips.values():
+                t.times.sort(key=lambda st: st.seq)
+            self._merge_platforms(parents)
+            for t in self.trips.values():
+                for st in t.times:
+                    if st.stop_id in self.stops:
+                        self.stops[st.stop_id].routes.add(t.route_id)
+
+            self._read_calendar(rows)
+            for r in rows("transfers.txt"):
+                # transfer_type 4 = in-seat transfer: same physical train continues.
+                if r.get("transfer_type") == "4" and r.get("from_trip_id") and r.get("to_trip_id"):
+                    self.next_trip[r["from_trip_id"]] = r["to_trip_id"]
+                    self.prev_trip[r["to_trip_id"]] = r["from_trip_id"]
+
+        # Per-stop index of (trip, position) for fast lookups.
+        self.stop_index: dict[str, list[tuple[Trip, int]]] = {}
+        for t in self.trips.values():
+            for i, st in enumerate(t.times):
+                self.stop_index.setdefault(st.stop_id, []).append((t, i))
+
+    def _merge_platforms(self, parents: dict[str, str]) -> None:
+        """Hook for feeds whose stations are split into several stops (see MetroFeed);
+        Regional Rail has one stop per station."""
+
+    # -- metadata ----------------------------------------------------------
+
+    def route_name(self, route_id: str) -> str:
+        r = self.routes.get(route_id, {})
+        return r.get("route_long_name") or r.get("route_short_name") or route_id
+
     # -- stations ----------------------------------------------------------
 
-    def resolve_station(self, query: str) -> Stop:
+    def resolve_station(self, query: str, routes: set[str] | None = None) -> Stop:
+        """The station `query` names. With routes, only stations those routes serve count."""
         q = query.strip()
+        q = self.stop_alias.get(q, q)
         if q in self.stops:  # a stop_id
             return self.stops[q]
         n = normalize(q)
         if not n:
-            raise StationNotFound(query, [])
-        if n in self._name_index:
-            return self._name_index[n]
-        if n in _GROUPS:
-            raise AmbiguousStation(query, _GROUPS[n])
-        alias = _ALIASES.get(n)
-        if alias:
-            return self._name_index[normalize(alias)]
+            raise StationNotFound(query, [], self.KIND)
+        index = self._name_index
+        if routes:
+            index = {k: s for k, s in index.items() if s.routes & routes}
+        if n in index:
+            return index[n]
+        group = [name for name in self.GROUPS.get(n, []) if normalize(name) in index]
+        if len(group) > 1:
+            raise AmbiguousStation(query, group)
+        alias = group[0] if group else self.ALIASES.get(n)
+        if alias and normalize(alias) in index:
+            return index[normalize(alias)]
 
         # Whole-word containment: "swarthmore college" -> no; "gwynedd" -> Gwynedd Valley.
         qwords = n.split()
         contains = [
-            s for key, s in self._name_index.items()
+            s for key, s in index.items()
             if all(re.search(rf"\b{re.escape(w)}\b", key) for w in qwords)
         ]
         if len(contains) == 1:
@@ -402,27 +448,30 @@ class RailFeed:
             raise AmbiguousStation(query, sorted(s.name for s in contains))
 
         scored = sorted(
-            ((SequenceMatcher(None, n, key).ratio(), s) for key, s in self._name_index.items()),
+            ((SequenceMatcher(None, n, key).ratio(), s) for key, s in index.items()),
             key=lambda x: -x[0],
         )
         if scored and scored[0][0] >= 0.85 and (len(scored) == 1 or scored[0][0] - scored[1][0] > 0.05):
             return scored[0][1]
-        raise StationNotFound(query, [s.name for score, s in scored[:4] if score >= 0.5])
+        raise StationNotFound(query, [s.name for score, s in scored[:4] if score >= 0.5], self.KIND)
 
-    def search_stations(self, query: str, limit: int = 8) -> list[Stop]:
+    def search_stations(self, query: str, limit: int = 8, routes: set[str] | None = None) -> list[Stop]:
+        index = self._name_index
+        if routes:
+            index = {k: s for k, s in index.items() if s.routes & routes}
         n = normalize(query)
         if not n:
-            return sorted(self.stops.values(), key=lambda s: s.name)[:limit]
+            return sorted(index.values(), key=lambda s: s.name)[:limit]
         out = []
-        for key, s in self._name_index.items():
+        for key, s in index.items():
             score = SequenceMatcher(None, n, key).ratio()
             if n in key:
                 score += 1
-            if any(n == normalize(a) for a, target in _ALIASES.items() if target == s.name):
+            if any(n == normalize(a) for a, target in self.ALIASES.items() if target == s.name):
                 score += 2
             out.append((score, s))
-        if n in _GROUPS:
-            names = set(_GROUPS[n])
+        if n in self.GROUPS:
+            names = set(self.GROUPS[n])
             out = [(sc + (3 if s.name in names else 0), s) for sc, s in out]
         out.sort(key=lambda x: -x[0])
         return [s for sc, s in out[:limit] if sc > 0.45]
@@ -549,26 +598,13 @@ class RailFeed:
         best: dict[tuple, tuple[Ride, Ride]] = {}
         cache: dict[tuple[str, date], list[Ride]] = {}
         for leg1, xfer in first_legs:
-            earliest = leg1.arrive_dt + timedelta(minutes=min_transfer_min)
-            latest = leg1.arrive_dt + timedelta(minutes=max_wait_min)
-            for sd in (leg1.service_date, leg1.service_date + timedelta(days=1)):
-                key = (xfer.stop_id, sd)
-                if key not in cache:
-                    cache[key] = self.rides_on_service_day(xfer, dest, sd)
-                for leg2 in cache[key]:
-                    if leg2.train == leg1.train:
-                        continue
-                    if earliest <= leg2.depart_dt <= latest:
-                        k = (leg1.depart_dt, leg1.train)
-                        cur = best.get(k)
-                        if (
-                            cur is None
-                            or leg2.arrive_dt < cur[1].arrive_dt
-                            # Same arrival: board the second train as late as possible,
-                            # i.e. transfer before you'd have to backtrack.
-                            or (leg2.arrive_dt == cur[1].arrive_dt and leg2.depart_dt > cur[1].depart_dt)
-                        ):
-                            best[k] = (leg1, leg2)
+            # Change trains where this one stops, or walk to a nearby stop on another line.
+            for board_id, walk in [(xfer.stop_id, 0), *self.walk_links.get(xfer.stop_id, [])]:
+                if board_id == dest.stop_id:
+                    continue
+                self._best_connections(
+                    leg1, self.stops[board_id], dest, min_transfer_min + walk, max_wait_min + walk, cache, best
+                )
 
         journeys = sorted(best.values(), key=lambda j: (j[0].depart_dt, j[1].arrive_dt))
         # Drop itineraries dominated by a later departure arriving at the same time or earlier.
@@ -582,6 +618,38 @@ class RailFeed:
                 continue
             out.append(j)
         return out
+
+    def _best_connections(
+        self,
+        leg1: Ride,
+        board: Stop,
+        dest: Stop,
+        min_wait_min: int,
+        max_wait_min: int,
+        cache: dict[tuple[str, date], list[Ride]],
+        best: dict[tuple, tuple[Ride, Ride]],
+    ) -> None:
+        """Record in best the earliest-arriving ride from board to dest that leg1 connects to."""
+        earliest = leg1.arrive_dt + timedelta(minutes=min_wait_min)
+        latest = leg1.arrive_dt + timedelta(minutes=max_wait_min)
+        for sd in (leg1.service_date, leg1.service_date + timedelta(days=1)):
+            key = (board.stop_id, sd)
+            if key not in cache:
+                cache[key] = self.rides_on_service_day(board, dest, sd)
+            for leg2 in cache[key]:
+                if leg2.train == leg1.train:
+                    continue
+                if earliest <= leg2.depart_dt <= latest:
+                    k = (leg1.depart_dt, leg1.train)
+                    cur = best.get(k)
+                    if (
+                        cur is None
+                        or leg2.arrive_dt < cur[1].arrive_dt
+                        # Same arrival: board the second train as late as possible,
+                        # i.e. transfer before you'd have to backtrack.
+                        or (leg2.arrive_dt == cur[1].arrive_dt and leg2.depart_dt > cur[1].depart_dt)
+                    ):
+                        best[k] = (leg1, leg2)
 
     def stops_between(self, origin: Stop, dest: Stop) -> list[Stop]:
         """Stations a train passes between origin and dest, in order, on any day in the
@@ -717,16 +785,109 @@ def ride_to_dict(feed: RailFeed, r: Ride, query_date: date | None = None) -> dic
 # ---------------------------------------------------------------------------
 
 
-def _extract_rail_zip(blob: bytes) -> bytes:
+def gtfs_subset(gtfs_zip: bytes, route_types: set[str]) -> bytes:
+    """A GTFS zip cut down to the routes of the given route_types, with their trips,
+    stop times and stops. SEPTA's bus feed is ~150 MB unzipped, almost all of it bus
+    stop times; its subway and trolley routes are under a tenth of that."""
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(gtfs_zip)) as src, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+        names = set(src.namelist())
+
+        def rows(fname: str) -> tuple[list[str], list[dict]]:
+            with src.open(fname) as fh:
+                reader = csv.DictReader(io.TextIOWrapper(fh, encoding="utf-8-sig", newline=""))
+                return list(reader.fieldnames or []), list(reader)
+
+        def write(fname: str, fields: list[str], keep: list[dict]) -> None:
+            buf = io.StringIO()
+            w = csv.DictWriter(buf, fields, lineterminator="\n")
+            w.writeheader()
+            w.writerows(keep)
+            dst.writestr(fname, buf.getvalue())
+
+        fields, routes = rows("routes.txt")
+        routes = [r for r in routes if r.get("route_type") in route_types]
+        route_ids = {r["route_id"] for r in routes}
+        write("routes.txt", fields, routes)
+        fields, trips = rows("trips.txt")
+        trips = [t for t in trips if t["route_id"] in route_ids]
+        trip_ids = {t["trip_id"] for t in trips}
+        write("trips.txt", fields, trips)
+
+        # Millions of rows: filter lines by their trip_id column instead of parsing each one.
+        used_stops: set[str] = set()
+        with src.open("stop_times.txt") as fh, dst.open("stop_times.txt", "w") as oh:
+            text = io.TextIOWrapper(fh, encoding="utf-8-sig", newline="")
+            header = text.readline()
+            cols = next(csv.reader([header]))
+            ti, si = cols.index("trip_id"), cols.index("stop_id")
+            last = max(ti, si) + 1
+            oh.write(header.encode())
+            chunk = []
+            for line in text:
+                parts = line.split(",", last)
+                if len(parts) > last - 1 and parts[ti].strip('"') in trip_ids:
+                    used_stops.add(parts[si].strip('"'))
+                    chunk.append(line)
+                    if len(chunk) >= 10000:
+                        oh.write("".join(chunk).encode())
+                        chunk = []
+            oh.write("".join(chunk).encode())
+
+        fields, stops = rows("stops.txt")
+        parents = {s["parent_station"] for s in stops if s["stop_id"] in used_stops and s.get("parent_station")}
+        write("stops.txt", fields, [s for s in stops if s["stop_id"] in used_stops | parents])
+        for fname in ("agency.txt", "calendar.txt", "calendar_dates.txt", "feed_info.txt"):
+            if fname in names:
+                dst.writestr(fname, src.read(fname))
+    return out.getvalue()
+
+
+def _extract_feeds(blob: bytes) -> dict[str, bytes]:
+    """{"rail": ..., "metro": ..., "bus": ...} from a gtfs_public.zip bundle: the rail GTFS,
+    the Metro routes cut from the bus GTFS, and the bus routes in bus.build's compact form.
+    A bare GTFS zip is taken to be the rail feed, and then there's no Metro or bus feed."""
+    out: dict[str, bytes] = {}
     with zipfile.ZipFile(io.BytesIO(blob)) as z:
         names = z.namelist()
         if "stop_times.txt" in names:
-            return blob
+            return {"rail": blob}
         for n in names:
             if n.endswith("google_rail.zip"):
-                return z.read(n)
-    raise ValueError("Download did not contain google_rail.zip or GTFS files")
+                out["rail"] = z.read(n)
+            elif n.endswith("google_bus.zip"):
+                bus_gtfs = z.read(n)
+                try:
+                    out["metro"] = gtfs_subset(bus_gtfs, METRO_ROUTE_TYPES)
+                except Exception:  # noqa: BLE001 - rail still works without it
+                    log.exception("Could not extract the Metro routes from %s", n)
+                try:
+                    from . import bus  # bus builds on this module
 
+                    out["bus"] = bus.build(bus_gtfs)
+                except Exception:  # noqa: BLE001
+                    log.exception("Could not extract the bus routes from %s", n)
+    if "rail" not in out:
+        raise ValueError("Download did not contain google_rail.zip or GTFS files")
+    return out
+
+
+def _parse(kind: str, blob: bytes, source: str, fetched_at: float):
+    # metro and bus build on this module
+    if kind == "metro":
+        from .metro import MetroFeed
+
+        return MetroFeed(blob, source=source, fetched_at=fetched_at)
+    if kind == "bus":
+        from .bus import BusFeed
+
+        return BusFeed(blob, source=source, fetched_at=fetched_at)
+    return RailFeed(blob, source=source, fetched_at=fetched_at)
+
+
+FEED_NAMES = {"rail": "Regional Rail", "metro": "Metro (subway and trolley)", "bus": "bus"}
+# Bumped when _extract_feeds' output changes, so caches made before are re-downloaded once.
+CACHE_FORMAT = 2
 
 # SEPTA's download URLs only ever have the newest feed, which it publishes a few days
 # before that feed starts. Until then, the feed in effect comes from the GitHub releases.
@@ -739,30 +900,44 @@ def _today() -> date:
 
 
 class FeedManager:
-    """Keeps current RailFeeds, refreshing the cached zips when they get stale.
+    """Keeps current rail, Metro and bus feeds, refreshing the cached zips when they get
+    stale.
 
-    Normally that's just the newest feed. When the newest one hasn't started yet, it also
-    keeps the one in effect today, so dates before the switch still have a timetable.
+    Normally that's just the newest feeds. When the newest ones haven't started yet, it
+    also keeps the ones in effect today, so dates before the switch still have a timetable.
+    Each download is cached as one zip per kind (google_rail.zip, google_metro.zip,
+    google_bus.zip) plus a source.json naming where it came from; the "_in_effect" set has
+    the same files with that suffix. Feeds are parsed the first time they're asked for.
     """
 
     def __init__(
         self,
         data_dir: str | os.PathLike | None = None,
         urls: list[str] | None = None,
-        max_age_hours: float = 24.0,
+        max_age_hours: float | None = None,
         local_zip: str | None = None,
     ):
         self.data_dir = Path(data_dir or os.environ.get("SEPTA_DATA_DIR") or Path.home() / ".cache" / "septa-mcp")
         self.urls = urls or [u for u in os.environ.get("SEPTA_GTFS_URLS", "").split(",") if u] or DEFAULT_GTFS_URLS
+        # SEPTA announces timetable changes well ahead, so a weekly check is plenty; on Cloud
+        # Run a scheduled job (refresh(), via `septa-mcp --refresh-feeds`) does it instead.
+        if max_age_hours is None:
+            max_age_hours = float(os.environ.get("SEPTA_GTFS_MAX_AGE_HOURS", 7 * 24))
         self.max_age = max_age_hours * 3600
         self.local_zip = local_zip or os.environ.get("SEPTA_GTFS_ZIP")
-        self._feeds: dict[str, RailFeed] = {}  # cache file name -> parsed feed
+        self._feeds: dict[tuple[str, str], RailFeed] = {}  # (slot, kind) -> parsed feed
+        self._local: dict[str, bytes] | None = None
         self._lock = threading.Lock()
         self._last_attempt: dict[str, float] = {}
 
-    @property
-    def cache_path(self) -> Path:
-        return self.data_dir / "google_rail.zip"
+    def _path(self, slot: str, kind: str) -> Path:
+        return self.data_dir / f"google_{kind}{slot}.zip"
+
+    def _meta(self, slot: str) -> dict | None:
+        try:
+            return json.loads((self.data_dir / f"source{slot}.json").read_text())
+        except (OSError, ValueError):
+            return None
 
     def _download(self, urls: list[str]) -> tuple[bytes, str]:
         errors = []
@@ -770,7 +945,7 @@ class FeedManager:
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
                 with urllib.request.urlopen(req, timeout=60) as resp:
-                    return _extract_rail_zip(resp.read()), url
+                    return resp.read(), url
             except Exception as e:  # noqa: BLE001 - try the next mirror
                 errors.append(f"{url}: {e}")
                 log.warning("GTFS download failed from %s: %s", url, e)
@@ -793,58 +968,104 @@ class FeedManager:
             raise RuntimeError("No SEPTA GTFS release found that has started yet")
         return [RELEASE_ZIP.format(tag=max(started)[2])]
 
-    def _cached(self, name: str, urls, max_age: float) -> RailFeed | None:
-        """The feed cached as data_dir/name, re-downloaded from urls() when older than max_age."""
-        path = self.data_dir / name
-        src_file = path.with_suffix(".source.txt") if name != "google_rail.zip" else self.data_dir / "source.txt"
+    def _refresh(self, slot: str, urls, force: bool = False, raise_errors: bool = False) -> bool:
+        """Re-download slot's feeds from urls() when older than max_age, when cached in an
+        older CACHE_FORMAT (before the Metro or bus feeds were), or when forced. Returns
+        whether it downloaded. Failures are logged, and the cached feeds kept, unless
+        raise_errors or there's no cached feed."""
+        rail = self._path(slot, "rail")
         now = time.time()
-        cached_mtime = path.stat().st_mtime if path.exists() else 0
-        if now - cached_mtime > max_age and now - self._last_attempt.get(name, 0) > 900:  # don't hammer on failures
-            self._last_attempt[name] = now
-            try:
-                blob, url = self._download(urls())
-                self.data_dir.mkdir(parents=True, exist_ok=True)
-                tmp = path.with_suffix(".tmp")
-                tmp.write_bytes(blob)
-                tmp.replace(path)
-                src_file.write_text(url)
-                self._feeds[name] = RailFeed(blob, source=url, fetched_at=now)
-                return self._feeds[name]
-            except Exception:
-                if not path.exists():
-                    raise
-                log.exception("Refresh of %s failed; using cached feed", name)
+        stale = (
+            force
+            or now - (rail.stat().st_mtime if rail.exists() else 0) > self.max_age
+            or (self._meta(slot) or {}).get("format") != CACHE_FORMAT
+        )
+        if not stale or (not raise_errors and now - self._last_attempt.get(slot, 0) <= 900):  # don't hammer
+            return False
+        self._last_attempt[slot] = now
+        try:
+            blob, url = self._download(urls())
+            feeds = _extract_feeds(blob)
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            for kind in FEED_NAMES:
+                path = self._path(slot, kind)
+                if kind in feeds:
+                    tmp = path.with_suffix(".tmp")
+                    tmp.write_bytes(feeds[kind])
+                    tmp.replace(path)
+                else:
+                    path.unlink(missing_ok=True)
+            (self.data_dir / f"source{slot}.json").write_text(
+                json.dumps({"source": url, "kinds": sorted(feeds), "format": CACHE_FORMAT})
+            )
+            log.info("Downloaded SEPTA GTFS (%s) from %s", ", ".join(sorted(feeds)), url)
+            return True
+        except Exception:
+            if raise_errors or not rail.exists():
+                raise
+            log.exception("Refresh of the%s feed failed; using cached feed", slot.replace("_", " "))
+            return False
+
+    def refresh(self) -> None:
+        """Download the newest feeds now, whatever the cache's age, plus the ones in effect
+        today if the newest haven't started: for a scheduled job. Raises if a download fails."""
+        with self._lock:
+            self._refresh("", lambda: self.urls, force=True, raise_errors=True)
+            start, _ = self._load("", "rail").feed_range()
+            today = _today()
+            if start and start > today:
+                self._refresh("_in_effect", lambda: self._in_effect_urls(today), force=True, raise_errors=True)
+
+    def _load(self, slot: str, kind: str) -> RailFeed | None:
+        """The parsed feed cached for (slot, kind), re-parsed when the file is newer."""
+        path = self._path(slot, kind)
         if not path.exists():
             return None
-        feed = self._feeds.get(name)
-        if feed is None or feed.fetched_at < cached_mtime - 1:
-            feed = self._feeds[name] = RailFeed(
-                path.read_bytes(),
-                source=src_file.read_text() if src_file.exists() else str(path),
-                fetched_at=cached_mtime,
-            )
+        mtime = path.stat().st_mtime
+        feed = self._feeds.get((slot, kind))
+        if feed is None or feed.fetched_at < mtime - 1:
+            source = (self._meta(slot) or {}).get("source") or str(path)
+            feed = self._feeds[(slot, kind)] = _parse(kind, path.read_bytes(), source, mtime)
         return feed
 
-    def get(self, day: date | None = None) -> RailFeed:
-        """The feed with the timetable for `day` (default today): the newest one covering it."""
+    def get(self, day: date | None = None, kind: str = "rail"):
+        """The `kind` feed ("rail", "metro" or "bus") with the timetable for `day`
+        (default today): the newest one covering it."""
         with self._lock:
             if self.local_zip:
-                if "local" not in self._feeds:
-                    blob = _extract_rail_zip(Path(self.local_zip).read_bytes())
-                    self._feeds["local"] = RailFeed(blob, source=self.local_zip, fetched_at=os.path.getmtime(self.local_zip))
-                return self._feeds["local"]
+                if self._local is None:
+                    self._local = _extract_feeds(Path(self.local_zip).read_bytes())
+                if kind not in self._local:
+                    raise FeedUnavailable(f"{self.local_zip} has no {FEED_NAMES[kind]} schedule.")
+                if ("local", kind) not in self._feeds:
+                    self._feeds[("local", kind)] = _parse(
+                        kind, self._local[kind], self.local_zip, os.path.getmtime(self.local_zip)
+                    )
+                return self._feeds[("local", kind)]
 
             today = _today()
-            latest = self._cached("google_rail.zip", lambda: self.urls, self.max_age)
+            self._refresh("", lambda: self.urls)
+            latest = self._load("", kind)
+            if latest is not None:
+                # Past the cached timetable's last day (the weekly refresh missed a new one):
+                # don't wait for the cache to age out.
+                _, end = latest.feed_range()
+                if end and end < today and self._refresh("", lambda: self.urls, force=True):
+                    latest = self._load("", kind)
             if latest is None:
-                raise RuntimeError("SEPTA GTFS download failed recently; retrying later")
+                if not self._path("", "rail").exists():
+                    raise RuntimeError("SEPTA GTFS download failed recently; retrying later")
+                if (self._meta("") or {}).get("format") != CACHE_FORMAT:  # old cache, and the refresh failed
+                    raise FeedUnavailable(f"The {FEED_NAMES[kind]} schedule isn't downloaded yet; retrying later.")
+                raise FeedUnavailable(f"SEPTA's download had no {FEED_NAMES[kind]} schedule.")
             feeds = [latest]
             start, _ = latest.feed_range()
             if start and start > today:
                 # A released feed never changes, so the cached one is good until it's superseded.
                 in_effect = None
                 try:
-                    in_effect = self._cached("google_rail_in_effect.zip", lambda: self._in_effect_urls(today), self.max_age)
+                    self._refresh("_in_effect", lambda: self._in_effect_urls(today))
+                    in_effect = self._load("_in_effect", kind)
                 except Exception:  # noqa: BLE001
                     log.exception("Could not get the feed in effect before %s", start)
                 if in_effect:
