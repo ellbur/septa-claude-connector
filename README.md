@@ -1,5 +1,7 @@
 # SEPTA Regional Rail, Metro and bus connector for Claude
 
+**Public MCP URL:** https://septa-mcp-60753635813.us-east4.run.app/mcp
+
 An MCP server that lets Claude answer questions like:
 
 - "What times do trains leave Jefferson for Swarthmore on Saturday morning?"
