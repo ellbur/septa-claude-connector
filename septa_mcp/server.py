@@ -24,6 +24,7 @@ from .gtfs import (
     StationNotFound,
     fmt_time,
     fmt_time_on,
+    normalize,
     ride_to_dict,
     with_summary,
 )
@@ -56,6 +57,11 @@ the trolleys T1-T5, G1, D1, D2; and the M1 Norristown High Speed Line) and buses
   says buses replace trains between two stations, plan the trip as a train to the end of
   rail service plus the shuttle. When no train reaches the destination, results include
   partial_service: the trains to the closest station on the way that trains still reach.
+- Stations can close for months (trains bypass them during construction) and the
+  schedule tools only know stops that are open, so plan from the stops the tools return
+  (stops_near, find_metro_stop), not from memory. Metro results include service_alerts for the lines and
+  stations used (closed stations, shuttle buses, platform changes); pass them on, and use
+  service_alerts to check a line before recommending it.
 - Metro trips are identified by line and toward (the direction's last stop). Riders often
   use older names, which work as line names too: "MFL"/"the El" = L1, "BSL" = B1-B3,
   "Route 10" = T1, "Route 15" = G1, "Route 101" = D1, "NHSL" = M1.
@@ -550,7 +556,9 @@ async def service_alerts(
     mode: Literal["regional_rail", "metro", "bus"] | None = None,
 ) -> dict:
     """Current SEPTA service alerts, advisories and detours for Regional Rail, the Metro
-    (subway and trolleys) and buses.
+    (subway and trolleys) and buses, including closed stations, shuttle buses replacing
+    trains, platform changes and elevator outages. Alerts with upcoming: true haven't
+    started yet (see starts).
 
     line: a Regional Rail line ("Media/Wawa", "Paoli"), Metro line ("L1", "MFL", "Broad
         Street Line", "T3", "Route 101") or bus route ("42"). Omit for every line.
@@ -564,7 +572,7 @@ async def service_alerts(
         return {"error": str(e)}
     for a in alerts:
         if a["mode"] == "metro":
-            a["lines"] = metro.ALERT_LINES.get(a["route_id"], [])
+            a["lines"] = _alert_lines(a)
     if mode:
         alerts = [a for a in alerts if a["mode"] in (mode, "systemwide")]
     if line:
@@ -635,11 +643,95 @@ def _metro_alerts(*stations) -> dict:
     except realtime.SeptaAPIError as e:
         return {"alerts_error": str(e)}
     relevant = [
-        {**a, "lines": metro.ALERT_LINES.get(a["route_id"], [])}
+        {**a, "lines": _alert_lines(a)}
         for a in alerts
-        if a["mode"] == "systemwide" or set(metro.ALERT_LINES.get(a["route_id"], [])) & lines
+        if a["mode"] == "systemwide" or set(_alert_lines(a)) & lines
     ]
     return {"service_alerts": relevant} if relevant else {}
+
+
+def _alert_lines(a: dict) -> list[str]:
+    """The Metro lines an alert is about."""
+    return a.get("lines") or metro.ALERT_LINES.get(a["route_id"], [])
+
+
+def _alert_mentions(a: dict, name: str) -> bool:
+    """Whether an alert names this station or stop ("11th St" in "11th St Station Closed")."""
+    n = normalize(name)
+    text = normalize(" ".join(str(a.get(k) or "") for k in ("current", "advisory", "detour")))
+    return bool(n) and f" {n} " in f" {text} "
+
+
+ALERTS_NOTE = (
+    "Current SEPTA alerts for these lines and stops: closed stations, shuttle buses, platform "
+    "changes. The schedule doesn't reflect them; check them before giving directions."
+)
+
+
+def _metro_trip_alerts(lines: set[str], names: list[str]) -> dict:
+    """Alerts a rider on these Metro lines should know before setting out: the lines'
+    advisories (closed stations, shuttle buses, platform changes; not the overnight
+    buses' detours), plus any Metro alert naming one of these stations."""
+    try:
+        alerts = realtime.alerts()
+    except realtime.SeptaAPIError as e:
+        return {"alerts_error": str(e)}
+    relevant = [
+        {**a, "lines": _alert_lines(a)}
+        for a in alerts
+        if a["mode"] == "metro" and (
+            (set(_alert_lines(a)) & lines and ("advisory" in a or "current" in a))
+            or any(_alert_mentions(a, n) for n in names)
+        )
+    ]
+    return {"service_alerts": relevant, "alerts_note": ALERTS_NOTE} if relevant else {}
+
+
+def _metro_alerts_about(names: list[str]) -> dict:
+    """Metro alerts naming any of these stops, e.g. for a stop that isn't in the schedule
+    because it's closed."""
+    try:
+        alerts = realtime.alerts()
+    except realtime.SeptaAPIError:
+        return {}
+    about = [
+        {**a, "lines": _alert_lines(a)}
+        for a in alerts
+        if a["mode"] == "metro" and any(_alert_mentions(a, n) for n in names)
+    ]
+    return {"service_alerts": about} if about else {}
+
+
+def _not_named(feed, query: str, st) -> bool:
+    """Whether a stop was picked for query only because its name is close: "11th St"
+    finds 13th St, which is a different station."""
+    q = normalize(feed.stop_alias.get(query.strip(), query))
+    if query.strip() in feed.stops or query.strip() in feed.stop_alias or q in feed.ALIASES:
+        return False
+    return not set(q.split()) <= set(normalize(st.name).split())
+
+
+def _substitution_notes(feed, pairs: list[tuple[str, object]], result: dict) -> None:
+    """Add the Metro alerts naming a stop the rider asked for, and say so when that stop
+    isn't in the schedule and a similar name was used (a closed station: "11th St" finds
+    13th St or the trolley stop at Girard Av & 11th St)."""
+    about = _metro_alerts_about([q for q, _ in pairs]).get("service_alerts", [])
+    have = result.setdefault("service_alerts", [])
+    have += [a for a in about if a not in have]
+    if not have:
+        del result["service_alerts"]
+    notes = []
+    for query, st in pairs:
+        if normalize(query) == normalize(st.name):
+            continue
+        if any(_alert_mentions(a, query) for a in about):
+            notes.append(f"SEPTA has an alert about '{query}' (see service_alerts): it may be closed. "
+                         f"{st.name}, the closest name in the schedule, was used; tell the rider.")
+        elif _not_named(feed, query, st):
+            notes.append(f"No current stop is named '{query}', so {st.name}, the closest name, was used. "
+                         "Check it's the stop the rider meant.")
+    if notes:
+        result["station_note"] = " ".join(notes)
 
 
 def _line_labels(feed, routes) -> list[str]:
@@ -648,19 +740,21 @@ def _line_labels(feed, routes) -> list[str]:
 
 
 @mcp.tool(annotations=READ_ONLY)
-def find_metro_stop(query: str, line: str | None = None) -> dict:
+async def find_metro_stop(query: str, line: str | None = None) -> dict:
     """Look up SEPTA Metro stations and trolley stops by (partial) name, optionally on one
     line ("L1", "Broad Street Line", "T3", "Route 15"...).
 
     Returns matching stops with the lines that serve them. Trolley street stops are named
-    by intersection, e.g. "Lancaster Av & 40th St".
+    by intersection, e.g. "Lancaster Av & 40th St". A station that's closed isn't in the
+    schedule; service_alerts then has SEPTA's alert about it.
     """
     try:
         codes = _line_codes(line)
         feed = _metro_feed()
     except (ValueError, FeedUnavailable) as e:
         return {"error": str(e)}
-    return {
+    stops = feed.search_stations(query, routes=codes)
+    result: dict = {
         "query": query,
         "stops": [
             {
@@ -669,9 +763,16 @@ def find_metro_stop(query: str, line: str | None = None) -> dict:
                 "lines": _line_labels(feed, s.routes),
                 "wheelchair_accessible": s.wheelchair,
             }
-            for s in feed.search_stations(query, routes=codes)
+            for s in stops
         ],
     }
+    about = await anyio.to_thread.run_sync(_metro_alerts_about, [query])
+    if about:
+        result.update(about)
+        if not any(normalize(s.name) == normalize(query) for s in stops):
+            result["note"] = (f"No current station is named '{query}'; SEPTA's alerts about it are in "
+                              "service_alerts (it may be closed). The stops listed only have similar names.")
+    return result
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -707,6 +808,10 @@ async def metro_schedule(
     Subway (L1, B1-B3) times are approximate. Each subway line gets at least three times,
     even past depart_before, with minutes_after_previous, and subway_frequency says how
     often trains run; tell the rider both rather than one exact time.
+
+    The times are the published schedule. service_alerts lists current SEPTA alerts for
+    the lines and stations used (closed stations, shuttle buses, platform changes): pass
+    them on. station_note says when a stop the rider named isn't in the schedule.
     """
     return await anyio.to_thread.run_sync(
         lambda: _metro_schedule(from_stop, to_stop, date, depart_after, depart_before, line, max_results)
@@ -726,7 +831,7 @@ def _metro_schedule(from_stop, to_stop, date, depart_after, depart_before, line,
         origin = feed.resolve_station(from_stop, codes)
         dest = feed.resolve_station(to_stop, codes)
     except (StationNotFound, AmbiguousStation) as e:
-        return _station_error(e)
+        return {**_station_error(e), **_metro_alerts_about([from_stop, to_stop])}
     if origin.stop_id == dest.stop_id:
         return {"error": "Origin and destination are the same stop."}
 
@@ -742,6 +847,7 @@ def _metro_schedule(from_stop, to_stop, date, depart_after, depart_before, line,
         nearby = on_line or nearby
     rides = [r for r in nearby if ws <= r.depart_dt <= we]
     shown = _with_subway_minimum(feed, rides[:max_results], nearby, ws)
+    journeys = []
     if shown:
         result["trips"] = [_metro_trip(feed, r, nearby, day) for r in shown]
         more = len(rides) - sum(1 for r in shown if ws <= r.depart_dt <= we)
@@ -759,6 +865,12 @@ def _metro_schedule(from_stop, to_stop, date, depart_after, depart_before, line,
             result["trips"] = []
             result["note"] = "No scheduled service between these stops in this window."
             result.update(_metro_alerts(origin, dest))
+    if "service_alerts" not in result and "alerts_error" not in result:
+        used = {r.board_trip.route_id for r in shown} or {
+            leg.board_trip.route_id for j in journeys[:max_results] for leg in j
+        }
+        result.update(_metro_trip_alerts(used, [from_stop, to_stop, origin.name, dest.name]))
+    _substitution_notes(feed, [(from_stop, origin), (to_stop, dest)], result)
     result["schedule_source"] = feed.summary()
     return result
 
@@ -849,13 +961,15 @@ async def metro_departures(stop: str, line: str | None = None, count: int = 10) 
     least three times with minutes_after_previous, and subway_frequency says how often
     trains run; tell the rider both rather than one exact time. At a busy stop the subway
     times are cut to one or two per direction (subway_trimmed); pass line for more.
+    service_alerts lists current alerts for these lines and this stop (closed stations,
+    shuttle buses, platform changes): pass them on.
     """
     try:
         codes = _line_codes(line)
         feed = _metro_feed()
         st = feed.resolve_station(stop, codes)
     except (StationNotFound, AmbiguousStation) as e:  # before ValueError: they're ValueErrors
-        return _station_error(e)
+        return {**_station_error(e), **await anyio.to_thread.run_sync(_metro_alerts_about, [stop])}
     except (ValueError, FeedUnavailable) as e:
         return {"error": str(e)}
 
@@ -929,6 +1043,10 @@ async def metro_departures(stop: str, line: str | None = None, count: int = 10) 
     if not result["departures"]:
         result["note"] = "No departures from this stop in the next six hours."
         result.update(await anyio.to_thread.run_sync(_metro_alerts, st))
+    else:
+        lines = {t.route_id for _, _, t, _ in shown}
+        result.update(await anyio.to_thread.run_sync(_metro_trip_alerts, lines, [stop, st.name]))
+    await anyio.to_thread.run_sync(_substitution_notes, feed, [(stop, st)], result)
     vs, ve = feed.feed_range()
     if vs and ve and not (vs <= current.date() <= ve):
         result["warning"] = f"Today is outside the published Metro schedule ({vs.isoformat()} to {ve.isoformat()})."

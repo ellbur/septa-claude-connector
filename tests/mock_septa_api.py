@@ -2,7 +2,8 @@
 
 Used by the tests (and handy for offline development):
     python tests/mock_septa_api.py 8765
-    SEPTA_API_BASE=http://127.0.0.1:8765/api septa-mcp --transport http
+    SEPTA_API_BASE=http://127.0.0.1:8765/api SEPTA_GTFSRT_BASE=http://127.0.0.1:8765/gtfsrt \
+        septa-mcp --transport http
 """
 
 from __future__ import annotations
@@ -10,10 +11,13 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
+
+from septa_mcp.gtfsrt import Alert, encode_alerts
 
 
 def _clock(minutes_from_now: int) -> str:
@@ -93,6 +97,36 @@ ALERTS = [
 ]
 
 
+DAY = 86400
+
+
+def gtfsrt_alerts(q):
+    """SEPTA's GTFS-realtime alerts (bus, trolley and subway): many aren't in ALERTS."""
+    now = int(time.time())
+    return encode_alerts([
+        Alert("1", [(now - 30 * DAY, now + 300 * DAY)], ["L1"], cause="construction", effect="modified service",
+              header="11th St Station Closed",
+              description="11th St and the 11th St concourse is closed to fast-track elevator construction and "
+                          "renovations. Please use 13th St during construction."),
+        # Also in ALERTS (as trolley_route_10).
+        Alert("2", [(now - DAY, now + DAY)], ["T1"], header="Shuttle Buses",
+              description="Buses replace T1 trolleys west of 40th St this weekend."),
+        Alert("3", [(now - 3 * DAY, now - DAY)], ["M1"], header="Over", description="Shuttle buses yesterday."),
+        Alert("4", [(now + 2 * DAY, now + 6 * DAY)], ["B1"], header="Southbound Platform Boarding Snyder and Oregon",
+              description="Passengers must board on the southbound platforms at Snyder and Oregon stations."),
+        Alert("5", [], ["76"], effect="detour", header="Motorcycle Toy Run",
+              description="SB via Frankford Ave, Right on Girard Ave, Reg Rt"),
+        Alert("6", [], trip_ids=["869070"], effect="no service", header="Trip cancellation for trip 869070."),
+    ])
+
+
+def gtfsrt_rail_alerts(q):
+    return encode_alerts([
+        Alert("7", [(int(time.time()) - DAY, None)], ["WTR"], header="West Trenton Station Waiting Room Closed",
+              description="The waiting room at West Trenton Station is closed until further notice."),
+    ])
+
+
 BUS_42 = [
     {"lat": "39.95265", "lng": "-75.20951", "label": "3677", "VehicleID": "3677", "route_id": "42",
      "trip": "880000", "BlockID": "4201", "Direction": "Westbound", "destination": "Wycombe", "heading": 270,
@@ -168,6 +202,8 @@ ROUTES = {
     "/api/RRSchedules/index.php": lambda q: RR_SCHEDULE if q.get("req1") == ["5317"] else BadRequest(
         f"An invalid parameter was used. No train found with train #{q.get('req1', [''])[0]}."),
     "/api/Alerts/get_alert_data.php": lambda q: ALERTS,
+    "/gtfsrt/septa-pa-us/Service/rtServiceAlerts.pb": gtfsrt_alerts,
+    "/gtfsrt/septarail-pa-us/Service/rtServiceAlerts.pb": gtfsrt_rail_alerts,
     "/nominatim/search": geocoder,
     "/api/TransitView/index.php": transit_view,
     # Every route at once; the real one is ~300 KB.
@@ -201,9 +237,10 @@ class Handler(BaseHTTPRequestHandler):
             bad = [n for n in q.get("req1", []) + q.get("req2", []) if n in NTA_INVALID]
             if bad:
                 data = BadRequest(f"An error has occurred. '{bad[0]}' is not a valid station,")
-        body = json.dumps(data).encode()
+        binary = isinstance(data, bytes)
+        body = data if binary else json.dumps(data).encode()
         self.send_response(400 if isinstance(data, BadRequest) else 200 if fn else 404)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/x-protobuf" if binary else "application/json")
         self.end_headers()
         self.wfile.write(body)
 
@@ -219,5 +256,5 @@ def start(port: int = 0) -> ThreadingHTTPServer:
 
 if __name__ == "__main__":
     s = start(int(sys.argv[1]) if len(sys.argv) > 1 else 8765)
-    print(f"Mock SEPTA API on http://127.0.0.1:{s.server_port}/api")
+    print(f"Mock SEPTA API on http://127.0.0.1:{s.server_port}/api (GTFS-realtime under /gtfsrt)")
     threading.Event().wait()
