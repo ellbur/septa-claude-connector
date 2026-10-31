@@ -36,7 +36,7 @@ trolley and bus positions, and alerts for every mode).
 | `bus_departures(stop, route, count)` | GTFS + live (TransitViewAll) | Next buses from a stop, with live delays and which side of the street each leaves from. |
 | `bus_vehicles(route)` | Live (TransitView) | Where a route's buses are and how late. |
 | `find_bus_stop(query, route)` | GTFS | Bus stops by cross streets or stop number. |
-| `service_alerts(line, mode)` | Live (Alerts) | Advisories and detours for Regional Rail, Metro and bus routes. |
+| `service_alerts(line, mode)` | Live (Alerts + GTFS-realtime) | Advisories and detours for Regional Rail, Metro and bus routes, including closed stations, shuttle buses and platform changes. |
 | `find_place(query)` | Geocoder + GTFS | A landmark, address, neighborhood or town → coordinates, plus SEPTA stops named like it. |
 | `stops_near(lat, lon \| place, radius_m, modes)` | GTFS (+ geocoder) | Stops of every mode around a point, with walking minutes; each nearby bus route's closest stop; the nearest rail and Metro stations. |
 | `stops_on_street(street, place \| lat/lon, radius_m)` | GTFS (+ geocoder) | Stops along a street in order, by cross street, one stretch per town or segment. |
@@ -66,6 +66,13 @@ v202609271 feed returns trains 5301, 5305, 5309, 5313, 5317 and 5321, leaving Je
 When no train reaches the destination (e.g. buses replace trains on the last stretch of a
 line), results list the alerts for the line plus `partial_service`: the trains to the
 closest station on the way that trains still reach, where riders change to the shuttle.
+
+Metro results (`metro_schedule`, `metro_departures`) always carry the current alerts for
+the lines they use (`service_alerts`), since the timetable doesn't show a station that
+trains bypass or a stretch run by shuttle buses. When a rider names a stop that isn't in
+the schedule (11th St on the L1 is closed and bypassed until August 2027), the closest name
+is used, and `station_note` says so and points to SEPTA's alert about the stop, if any.
+`find_metro_stop` returns those alerts too.
 
 ## SEPTA quirks it handles
 
@@ -121,6 +128,13 @@ plus `subway_frequency` ("L1 toward Frankford Transit Center runs about every 6 
 swamp the departure board (15th St/City Hall has six subway directions), so past 12 entries
 the board cuts subway directions to two times each, then one; each keeps its gap to the
 train before, and the result says to ask for one line to see more.
+
+**Two alert feeds.** SEPTA's JSON alerts API (`/Alerts/get_alert_data.php`) leaves out
+many alerts that its GTFS-realtime alert feeds have: station closures (11th St on the L1),
+M1 and D shuttle buses, platform changes and elevator outages. `service_alerts` reads both
+and drops GTFS-realtime alerts whose text the JSON API already has. GTFS-realtime alerts
+that name only single trips (cancelled bus trips) are left out. They're read with a small
+built-in protobuf decoder (`septa_mcp/gtfsrt.py`), so there's no protobuf dependency.
 
 ## Run it
 
@@ -229,10 +243,12 @@ For local use only, point a desktop MCP client at the stdio command instead:
 | `SEPTA_GTFS_URLS` | SEPTA, then GitHub | Comma-separated download URLs |
 | `SEPTA_GTFS_MAX_AGE_HOURS` | `168` (a week) | Re-download the timetables when the cache is older than this |
 | `SEPTA_API_BASE` | `https://www3.septa.org/api` | Real-time API base (point at the mock for offline dev) |
+| `SEPTA_GTFSRT_BASE` | `https://www3.septa.org/gtfsrt` | GTFS-realtime base, for the alerts the JSON API leaves out |
 | `SEPTA_GEOCODER_URL` | `https://nominatim.openstreetmap.org/search` | Nominatim-compatible place search |
 | `SEPTA_GEOCODER_EMAIL` | — | Contact address sent to the geocoder, which Nominatim asks heavier users for |
 | `SEPTA_API_TIMEOUT` | `10` | Seconds per real-time request |
 | `SEPTA_API_CACHE_SECONDS` | `10` | How long identical real-time requests share a response |
+| `SEPTA_ALERTS_CACHE_SECONDS` | `60` | How long alerts are reused (the Metro tools fetch them with every answer) |
 | `SEPTA_API_MAX_PER_MINUTE` | `60` | Most real-time requests sent to SEPTA in any 60 seconds (per process) |
 | `MCP_TRANSPORT`, `HOST`, `PORT` | `stdio`, `0.0.0.0`, `8000` | Server transport settings |
 

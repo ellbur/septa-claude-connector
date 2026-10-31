@@ -1,5 +1,6 @@
 """Thin client for SEPTA's real-time JSON API (https://www3.septa.org/api/): Regional Rail
-boards and train positions, trolley and bus positions (TransitView), and alerts.
+boards and train positions, trolley and bus positions (TransitView), and alerts, which
+also come from SEPTA's GTFS-realtime alert feeds (https://www3.septa.org/gtfsrt/).
 
 The real-time API predates the current GTFS feed and uses its own station names for
 a couple dozen stops; `api_station_name` translates GTFS names to the ones it accepts.
@@ -21,7 +22,12 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from . import gtfsrt
+
 BASE_URL = os.environ.get("SEPTA_API_BASE", "https://www3.septa.org/api")
+GTFSRT_BASE = os.environ.get("SEPTA_GTFSRT_BASE", "https://www3.septa.org/gtfsrt")
+# Bus, trolley and subway alerts; Regional Rail alerts.
+GTFSRT_ALERT_PATHS = ("/septa-pa-us/Service/rtServiceAlerts.pb", "/septarail-pa-us/Service/rtServiceAlerts.pb")
 USER_AGENT = "septa-mcp/0.1"
 TIMEOUT = float(os.environ.get("SEPTA_API_TIMEOUT", "10"))
 # Identical requests within CACHE_SECONDS share one response, and at most MAX_PER_MINUTE
@@ -29,6 +35,8 @@ TIMEOUT = float(os.environ.get("SEPTA_API_TIMEOUT", "10"))
 # single instance so the limit holds for the whole app.
 CACHE_SECONDS = float(os.environ.get("SEPTA_API_CACHE_SECONDS", "10"))
 MAX_PER_MINUTE = int(os.environ.get("SEPTA_API_MAX_PER_MINUTE", "60"))
+# Alerts change slowly and the Metro tools fetch them with every answer, so keep them longer.
+ALERTS_CACHE_SECONDS = float(os.environ.get("SEPTA_ALERTS_CACHE_SECONDS", "60"))
 TZ = ZoneInfo("America/New_York")
 
 # GTFS stop_name -> name the real-time API expects (only where they differ).
@@ -105,11 +113,16 @@ def _take_slot(now: float) -> float:
         return 0
 
 
-def _get(path: str, params: dict[str, Any] | None = None) -> Any:
+def _get(path: str, params: dict[str, Any] | None = None, ttl: float | None = None) -> Any:
     q = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
     url = f"{BASE_URL}{path}"
     if q:
         url += "?" + urllib.parse.urlencode(q)
+    return _cached(url, _fetch, ttl)
+
+
+def _cached(url: str, fetch, ttl: float | None = None) -> Any:
+    """fetch(url), or its answer from the last ttl (default CACHE_SECONDS) seconds."""
     with _lock:
         url_lock = _url_locks.setdefault(url, threading.Lock())
     # One request per URL at a time, so concurrent callers wait for the first one's answer.
@@ -125,14 +138,14 @@ def _get(path: str, params: dict[str, Any] | None = None) -> Any:
                 f"Live SEPTA data is paused: this server's limit of {MAX_PER_MINUTE} requests per minute "
                 f"to SEPTA, shared by all its users, was reached. Try again in about {max(1, round(wait))} seconds."
             )
-        data = _fetch(url)
+        data = fetch(url)
         with _lock:
             if len(_cache) > 500:
                 for k in [k for k, (exp, _) in _cache.items() if exp <= now]:
                     del _cache[k]
                     if not _url_locks[k].locked():
                         del _url_locks[k]
-            _cache[url] = (now + CACHE_SECONDS, data)
+            _cache[url] = (now + (CACHE_SECONDS if ttl is None else ttl), data)
         return data
 
 
@@ -160,6 +173,17 @@ def _fetch(url: str) -> Any:
     if isinstance(data, dict) and "error" in data and len(data) == 1:
         raise SeptaAPIError(f"SEPTA API error: {data['error']}")
     return data
+
+
+def _fetch_bytes(url: str) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        raise SeptaAPIError(f"SEPTA GTFS-realtime feed returned HTTP {e.code}") from e
+    except Exception as e:  # noqa: BLE001
+        raise SeptaAPIError(f"SEPTA GTFS-realtime feed unreachable ({e})") from e
 
 
 def _boolish(v: Any) -> bool:
@@ -340,8 +364,14 @@ def _alert_mode(route_id: str) -> str | None:
 
 def alerts() -> list[dict]:
     """Current alerts for every mode, each tagged with its mode: regional_rail, metro,
-    bus or systemwide. Rows with no message are left out."""
-    data = _get("/Alerts/get_alert_data.php")
+    bus or systemwide. Rows with no message are left out.
+
+    The JSON alerts API misses many alerts that SEPTA posts only to its GTFS-realtime
+    feeds (station closures, Metro shuttle buses, platform changes, elevator outages), so
+    those are added from there. If the GTFS-realtime feeds can't be read, the JSON alerts
+    are still returned.
+    """
+    data = _get("/Alerts/get_alert_data.php", ttl=ALERTS_CACHE_SECONDS)
     out = []
     for r in data if isinstance(data, list) else []:
         rid = str(r.get("route_id", ""))
@@ -374,6 +404,83 @@ def alerts() -> list[dict]:
                 if v:
                     alert[key] = v
         out.append(alert)
+    return out + _gtfsrt_alerts(out)
+
+
+# GTFS route_id -> the line name the JSON alerts API uses for Regional Rail.
+_RAIL_LINES = {
+    "AIR": "Airport", "CHE": "Chestnut Hill East", "CHW": "Chestnut Hill West", "CYN": "Cynwyd",
+    "FOX": "Fox Chase", "LAN": "Lansdale/Doylestown", "MED": "Media/Wawa", "NOR": "Manayunk/Norristown",
+    "PAO": "Paoli/Thorndale", "TRE": "Trenton", "WAR": "Warminster", "WIL": "Wilmington/Newark",
+    "WTR": "West Trenton",
+}
+# Metro line codes ("L1", "T3"); the feed also has "L1 OWL" for the overnight bus.
+_METRO_ROUTE = re.compile(r"^([BDGLMT]\d+)\b")
+# How much of a message to compare when deciding whether both sources have an alert.
+_SAME_TEXT_CHARS = 60
+
+
+def _squash(s: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+def _when(ts: int) -> str:
+    return datetime.fromtimestamp(ts, TZ).strftime("%b %d, %Y %I:%M %p").replace(" 0", " ")
+
+
+def _gtfsrt_alerts(have: list[dict], now: datetime | None = None) -> list[dict]:
+    """Alerts in SEPTA's GTFS-realtime feeds that aren't already in `have` (the JSON
+    API's), in the same shape. Alerts that name only trips (single cancelled bus trips)
+    are left out."""
+    parsed = []
+    for path in GTFSRT_ALERT_PATHS:
+        try:
+            parsed += _cached(
+                GTFSRT_BASE + path, lambda url: gtfsrt.parse_alerts(_fetch_bytes(url)), ALERTS_CACHE_SECONDS
+            )
+        except (SeptaAPIError, ValueError, IndexError):
+            continue  # the JSON alerts still stand
+    seen = " ".join(_squash(a.get(k)) for a in have for k in ("current", "advisory", "detour"))
+    now_ts = (now or datetime.now(TZ)).timestamp()
+    out = []
+    for a in parsed:
+        header = _strip_html(a.header)
+        text = _strip_html(a.description) or header
+        if not text or not a.route_ids:
+            continue
+        if a.periods and all(end and end < now_ts for _, end in a.periods):
+            continue  # over
+        key = _squash(text)[:_SAME_TEXT_CHARS]
+        if key in seen:
+            continue
+        seen += " " + key
+        upcoming = [p for p in a.periods if not p[1] or p[1] >= now_ts]
+        start, end = min(upcoming, key=lambda p: p[0] or 0) if upcoming else (None, None)
+        # a.effect is left out: SEPTA's are often wrong (delays filed as "additional service").
+        common = {}
+        if start and start > now_ts:
+            common["upcoming"] = True
+        if a.url and a.url.rstrip("/") != "https://www.septa.org/alerts":
+            common["url"] = a.url
+
+        when = {k: _when(t) for k, t in (("starts", start), ("ends", end)) if t}
+        body = text if not header or _squash(text).startswith(_squash(header)) else f"{header}\n{text}"
+        advisory = {"advisory": body, **when}
+        # A bus detour: the header is the reason, the text the routing.
+        detour = {"detour": text, **({"detour_reason": header} if header and header != text else {}),
+                  **{f"detour_{k}": v for k, v in when.items()}}
+
+        metro_lines = list(dict.fromkeys(m.group(1) for r in a.route_ids if (m := _METRO_ROUTE.match(r))))
+        if metro_lines:
+            out.append({"route_id": a.route_ids[0], "route_name": ", ".join(metro_lines), "mode": "metro",
+                        "lines": metro_lines, **advisory, **common})
+        for r in a.route_ids:
+            if r in _RAIL_LINES:
+                out.append({"route_id": r, "route_name": _RAIL_LINES[r], "mode": "regional_rail",
+                            **advisory, **common})
+            elif not _METRO_ROUTE.match(r):
+                out.append({"route_id": r, "route_name": r, "mode": "bus",
+                            **(detour if a.effect == "detour" else advisory), **common})
     return out
 
 

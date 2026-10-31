@@ -23,6 +23,7 @@ import mock_septa_api  # noqa: E402
 
 _mock = mock_septa_api.start()
 os.environ["SEPTA_API_BASE"] = f"http://127.0.0.1:{_mock.server_port}/api"
+os.environ["SEPTA_GTFSRT_BASE"] = f"http://127.0.0.1:{_mock.server_port}/gtfsrt"
 
 from mcp import Client  # noqa: E402
 
@@ -31,6 +32,7 @@ from septa_mcp.server import parse_clock, parse_date  # noqa: E402
 
 # In case realtime was imported (e.g. by test_live.py) before the env var was set.
 realtime.BASE_URL = os.environ["SEPTA_API_BASE"]
+realtime.GTFSRT_BASE = os.environ["SEPTA_GTFSRT_BASE"]
 geocode.GEOCODER_URL = f"http://127.0.0.1:{_mock.server_port}/nominatim/search"
 geocode.MIN_INTERVAL = 0
 
@@ -231,27 +233,102 @@ def test_rail_alerts():
 def test_alerts_by_mode():
     r = call("service_alerts", {"mode": "regional_rail"})
     # The alerts feed files the subway under rr_route_* too.
-    assert [a["route_id"] for a in r["alerts"]] == ["rr_route_med", "rr_route_wilm"]
+    assert [a["route_id"] for a in r["alerts"]] == ["rr_route_med", "rr_route_wilm", "WTR"]
     r = call("service_alerts", {"mode": "metro"})
+    # The GTFS-realtime T1 alert repeats trolley_route_10's and the M1 one is over.
     assert [(a["route_id"], a["lines"]) for a in r["alerts"]] == [
-        ("rr_route_mfo", ["L1"]), ("trolley_route_10", ["T1"])
+        ("rr_route_mfo", ["L1"]), ("trolley_route_10", ["T1"]), ("L1", ["L1"]), ("B1", ["B1"])
     ]
 
 
 def test_alerts_without_filters_summarize_buses():
     r = call("service_alerts", {})
     assert {a["mode"] for a in r["alerts"]} == {"regional_rail", "metro"}  # no app or bus rows
-    assert r["bus_routes_with_alerts"] == ["42"]
+    assert r["bus_routes_with_alerts"] == ["42", "76"]
 
 
 def test_alerts_by_line_across_modes():
-    assert [a["route_id"] for a in call("service_alerts", {"line": "MFL"})["alerts"]] == ["rr_route_mfo"]
+    assert [a["route_id"] for a in call("service_alerts", {"line": "MFL"})["alerts"]] == ["rr_route_mfo", "L1"]
     assert [a["route_id"] for a in call("service_alerts", {"line": "Route 10"})["alerts"]] == ["trolley_route_10"]
     (bus,) = call("service_alerts", {"line": "42"})["alerts"]
     assert bus["detour"].startswith("EB via Spruce St")
     assert (bus["detour_from"], bus["detour_starts"]) == ("Spruce & 38th", "10/26/2026 7:41 AM")
     r = call("service_alerts", {"line": "T3"})
     assert r["alerts"] == [] and "Media/Elwyn" in r["lines_with_alerts"]
+
+
+def test_alerts_from_gtfs_realtime():
+    """Alerts only SEPTA's GTFS-realtime feeds carry, in the JSON alerts' shape."""
+    (closed,) = [a for a in realtime.alerts() if a["route_id"] == "L1"]
+    assert closed["mode"] == "metro" and closed["lines"] == ["L1"]
+    assert closed["advisory"].startswith("11th St Station Closed\n11th St and the 11th St concourse is closed")
+    assert closed["starts"] and closed["ends"] and "upcoming" not in closed
+    (platforms,) = [a for a in realtime.alerts() if a["route_id"] == "B1"]
+    assert platforms["upcoming"] is True
+    (detour,) = call("service_alerts", {"line": "76"})["alerts"]
+    assert (detour["detour"], detour["detour_reason"]) == (
+        "SB via Frankford Ave, Right on Girard Ave, Reg Rt", "Motorcycle Toy Run")
+    (wtr,) = call("service_alerts", {"line": "West Trenton"})["alerts"]
+    assert wtr["advisory"].startswith("West Trenton Station Waiting Room Closed")
+    # Single cancelled trips aren't listed.
+    assert not any("Trip cancellation" in str(a) for a in realtime.alerts())
+
+
+def test_alerts_without_gtfs_realtime(monkeypatch):
+    monkeypatch.setattr(realtime, "GTFSRT_BASE", realtime.GTFSRT_BASE + "/missing")
+    assert [a["route_id"] for a in call("service_alerts", {"line": "MFL"})["alerts"]] == ["rr_route_mfo"]
+
+
+def test_gtfsrt_round_trip():
+    from septa_mcp import gtfsrt
+
+    a = gtfsrt.Alert("9", [(1, 2), (3, None)], ["L1", "B3"], ["283"], ["123"], "construction", "detour",
+                     "severe", "https://example.com", "Header", "Text")
+    assert gtfsrt.parse_alerts(gtfsrt.encode_alerts([a])) == [a]
+
+
+def test_metro_trips_include_line_alerts():
+    r = call("metro_schedule", {"from_stop": "13th St", "to_stop": "46th St", "line": "L1",
+                                "date": next_weekday(1).isoformat(), "depart_after": "10:00"})
+    assert r["trips"]
+    assert any(a["advisory"].startswith("11th St Station Closed") for a in r["service_alerts"])
+    assert not any(a["mode"] != "metro" or "L1" not in a["lines"] for a in r["service_alerts"])
+    assert "station_note" not in r
+
+    r = call("metro_departures", {"stop": "13th St", "line": "L1"})
+    assert any(a["advisory"].startswith("11th St Station Closed") for a in r["service_alerts"])
+
+
+def test_closed_station_points_to_its_alert():
+    # 11th St is closed: it's not in the schedule, and its name is close to 13th St's.
+    r = call("metro_schedule", {"from_stop": "11th St", "to_stop": "46th St", "line": "L1",
+                                "date": next_weekday(1).isoformat(), "depart_after": "10:00"})
+    assert r["from"] == "13th St"
+    assert r["station_note"].startswith("SEPTA has an alert about '11th St' (see service_alerts): it may be closed. 13th St")
+    assert any(a["advisory"].startswith("11th St Station Closed") for a in r["service_alerts"])
+
+    r = call("find_metro_stop", {"query": "11th St"})
+    assert "No current station is named '11th St'" in r["note"]
+    assert [a["route_id"] for a in r["service_alerts"]] == ["L1"]
+    assert "service_alerts" not in call("find_metro_stop", {"query": "46th St"})
+    # Without a line, the closest name is a trolley stop.
+    r = call("metro_departures", {"stop": "11th Street Station"})
+    assert r["stop"] == "Girard Av & 11th St"
+    assert "alert about '11th Street Station'" in r["station_note"]
+    assert "L1" in [a["route_id"] for a in r["service_alerts"]]
+    # A name too far from any station's gets the alerts with the error.
+    r = call("metro_departures", {"stop": "11th St Station Concourse"})
+    assert "error" in r and [a["route_id"] for a in r["service_alerts"]] == ["L1"]
+
+
+def test_close_name_without_alert_is_flagged():
+    r = call("metro_schedule", {"from_stop": "Spring Gardn", "to_stop": "13th St", "line": "L1",
+                                "date": next_weekday(1).isoformat(), "depart_after": "10:00"})
+    assert r["station_note"].startswith("No current stop is named 'Spring Gardn', so Spring Garden")
+    # Aliases and exact names aren't substitutions.
+    r = call("metro_schedule", {"from_stop": "City Hall", "to_stop": "46th Street",
+                                "date": next_weekday(1).isoformat(), "depart_after": "10:00"})
+    assert "station_note" not in r
 
 
 def test_empty_results_include_line_alerts():
