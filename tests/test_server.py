@@ -1074,6 +1074,49 @@ def test_expired_timetable_refreshes_before_a_week(fresh_manager, monkeypatch):
     assert len(downloads) == 2  # still past it (same feed came back): not again right away
 
 
+def _feed_starting(rail: bytes, start: date, end: date) -> bytes:
+    """rail with its feed_info dates changed: a newer release of the same timetable."""
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(rail)) as zin, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name in zin.namelist():
+            data = zin.read(name)
+            if name == "feed_info.txt":
+                head, row = data.decode("utf-8-sig").strip().splitlines()[:2]
+                cols = head.split(",")
+                vals = row.split(",")
+                vals[cols.index("feed_start_date")] = start.strftime("%Y%m%d")
+                vals[cols.index("feed_end_date")] = end.strftime("%Y%m%d")
+                data = (head + "\r\n" + ",".join(vals) + "\r\n").encode()
+            zout.writestr(name, data)
+    return out.getvalue()
+
+
+@pytest.mark.parametrize("via", ["service", "job"])
+def test_feed_published_early_keeps_todays_timetable(fresh_manager, monkeypatch, via):
+    fm, downloads, data = fresh_manager
+    today, end = fm.get().feed_range()  # the cached feed is the one in effect
+    upcoming = _feed_starting(server.feeds._path("", "rail").read_bytes(), today + timedelta(days=1),
+                              end + timedelta(days=21))
+    monkeypatch.setattr(gtfs.FeedManager, "_download", lambda self, urls: (upcoming, "https://example.test/new.zip"))
+
+    def no_github(self, today):
+        raise OSError("HTTP Error 403: rate limit exceeded")
+
+    monkeypatch.setattr(gtfs.FeedManager, "_in_effect_urls", no_github)
+    if via == "job":
+        fm.refresh()  # doesn't need GitHub, so doesn't fail
+    else:
+        _age(data / "google_rail.zip", 8)
+        fm._last_attempt.clear()
+        assert fm.get().feed_range()[0] == today
+    assert gtfs.feed_range_of((data / "google_rail.zip").read_bytes())[0] == today + timedelta(days=1)
+    fm._feeds.clear()  # parsed feeds are reloaded by mtime, and this all took under a second
+    s, e = fm.get().feed_range()
+    assert s <= today <= e  # today still has its timetable
+    assert fm.get(today + timedelta(days=1)).feed_range()[0] == today + timedelta(days=1)
+    assert json.loads((data / "source_in_effect.json").read_text())["source"] == "https://example.test/gtfs_public.zip"
+
+
 def test_refresh_feeds_cli(monkeypatch):
     calls = []
     monkeypatch.setattr(server.feeds, "refresh", lambda: calls.append("refresh"))
