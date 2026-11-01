@@ -355,8 +355,10 @@ def test_empty_results_include_line_alerts():
 
 
 def test_whole_day_window_shows_it_runs_into_next_morning():
-    r = call("train_schedule", {"from_station": "Jefferson", "to_station": "Swarthmore", "date": "2026-11-01"})
-    assert r["window"] == "Sun Nov 1, 12:00 AM – Mon Nov 2, 3:30 AM (next day)"
+    day = server.now().date() + timedelta(days=1)  # not today, whose window starts now
+    r = call("train_schedule", {"from_station": "Jefferson", "to_station": "Swarthmore", "date": day.isoformat()})
+    nxt = day + timedelta(days=1)
+    assert r["window"] == f"{day:%a %b} {day.day}, 12:00 AM – {nxt:%a %b} {nxt.day}, 3:30 AM (next day)"
 
 
 def test_times_after_midnight_marked_next_day():
@@ -368,19 +370,21 @@ def test_times_after_midnight_marked_next_day():
     assert late and any(t["arrive"].endswith("AM (next day)") for t in late), r["trains"]
 
 
-def _cut_off_before(monkeypatch, dest_name: str):
-    """Pretend trains stop short of dest_name, as during a shuttle-bus replacement."""
-    feed = server.feeds.get()
+def _cut_off_before(monkeypatch, dest_name: str, day: date | None = None):
+    """Pretend trains stop short of dest_name on `day` (default today), as during a
+    shuttle-bus replacement."""
+    feed = server.feeds.get(day)
     real = feed.direct_rides
     monkeypatch.setattr(feed, "direct_rides", lambda o, d, *a: [] if d.name == dest_name else real(o, d, *a))
     monkeypatch.setattr(feed, "transfer_journeys", lambda *a: [])
 
 
 def test_partial_service_when_trains_stop_short(monkeypatch):
-    _cut_off_before(monkeypatch, "Swarthmore")
+    day = next_weekday(5)
+    _cut_off_before(monkeypatch, "Swarthmore", day)
     r = call("train_schedule", {
         "from_station": "Jefferson", "to_station": "Swarthmore",
-        "date": next_weekday(5).isoformat(), "depart_after": "05:00", "depart_before": "12:00",
+        "date": day.isoformat(), "depart_after": "05:00", "depart_before": "12:00",
     })
     assert r["trains"] == []
     # Morton is the stop before Swarthmore on the Media/Wawa Line.
@@ -443,9 +447,9 @@ def test_todays_timetable_even_before_newest_feed_starts():
     assert "warning" not in r, r
 
 
-def test_in_effect_release_is_newest_started(monkeypatch):
-    releases = [{"tag_name": t} for t in ("v202611010", "v202609271", "v202609270", "v202609061")]
-    releases.append({"tag_name": "v202610250", "draft": True})
+def _fake_urlopen(monkeypatch, responses):
+    """urlopen returning responses[url prefix] (bytes, or an exception to raise); records URLs."""
+    asked = []
 
     class Resp(io.BytesIO):
         def __enter__(self):
@@ -454,9 +458,43 @@ def test_in_effect_release_is_newest_started(monkeypatch):
         def __exit__(self, *a):
             pass
 
-    monkeypatch.setattr(gtfs.urllib.request, "urlopen", lambda *a, **k: Resp(json.dumps(releases).encode()))
-    urls = gtfs.FeedManager()._in_effect_urls(date(2026, 10, 28))
-    assert urls == ["https://github.com/septadev/GTFS/releases/download/v202609271/gtfs_public.zip"]
+    def urlopen(req, *a, **k):
+        url = req.full_url if hasattr(req, "full_url") else req
+        asked.append(url)
+        for prefix, body in responses.items():
+            if url.startswith(prefix):
+                if isinstance(body, Exception):
+                    raise body
+                return Resp(body)
+        raise OSError(f"unexpected {url}")
+
+    monkeypatch.setattr(gtfs.urllib.request, "urlopen", urlopen)
+    return asked
+
+
+GIT_REFS = (
+    b"001e# service=git-upload-pack\n0000"
+    b"00b3" + b"4" * 40 + b" HEAD\x00multi_ack thin-pack side-band\n"
+    b"003f" + b"4" * 40 + b" refs/heads/master\n"
+    + b"".join(b"0040" + b"4" * 40 + b" refs/tags/" + t + b"\n"
+               for t in (b"v202609061", b"v202609270", b"v202609271", b"v202611010", b"v20261115"))
+    + b"0043" + b"4" * 40 + b" refs/tags/v202609271^{}\n0000"
+)
+
+
+def test_release_in_effect_is_newest_started(monkeypatch):
+    asked = _fake_urlopen(monkeypatch, {gtfs.RELEASE_REFS: GIT_REFS})
+    fm = gtfs.FeedManager()
+    assert fm._releases_for(date(2026, 10, 28)) == ["v202609271", "v202609270", "v202609061"]
+    assert fm._releases_for(date(2026, 11, 1))[0] == "v202611010"
+    assert len(asked) == 1  # the list is cached
+
+
+def test_release_list_falls_back_to_github_api(monkeypatch):
+    releases = [{"tag_name": t} for t in ("v202611010", "v202609271", "v202609270", "v202609061")]
+    releases.append({"tag_name": "v202610250", "draft": True})
+    _fake_urlopen(monkeypatch, {gtfs.RELEASE_REFS: OSError("git down"), gtfs.RELEASES_API: json.dumps(releases).encode()})
+    assert gtfs.FeedManager()._releases_for(date(2026, 10, 28))[0] == "v202609271"
 
 
 def test_next_trains_use_final_stop_not_line():
@@ -1155,10 +1193,10 @@ def test_feed_published_early_keeps_todays_timetable(fresh_manager, monkeypatch,
                               end + timedelta(days=21))
     monkeypatch.setattr(gtfs.FeedManager, "_download", lambda self, urls: (upcoming, "https://example.test/new.zip"))
 
-    def no_github(self, today):
+    def no_github(self):
         raise OSError("HTTP Error 403: rate limit exceeded")
 
-    monkeypatch.setattr(gtfs.FeedManager, "_in_effect_urls", no_github)
+    monkeypatch.setattr(gtfs.FeedManager, "_release_tags", no_github)
     if via == "job":
         fm.refresh()  # doesn't need GitHub, so doesn't fail
     else:
@@ -1171,6 +1209,72 @@ def test_feed_published_early_keeps_todays_timetable(fresh_manager, monkeypatch,
     assert s <= today <= e  # today still has its timetable
     assert fm.get(today + timedelta(days=1)).feed_range()[0] == today + timedelta(days=1)
     assert json.loads((data / "source_in_effect.json").read_text())["source"] == "https://example.test/gtfs_public.zip"
+
+
+_real_release_tags = gtfs.FeedManager._release_tags
+
+
+@pytest.fixture
+def releases(fresh_manager, monkeypatch):
+    """fresh_manager whose newest feed starts tomorrow, with GitHub releases (one per 3 weeks
+    before it) that downloads return. Today's timetable is only in a release."""
+    fm, downloads, data = fresh_manager
+    rail = server.feeds._path("", "rail").read_bytes()
+    today, end = gtfs.RailFeed(rail).feed_range()
+    newest = today + timedelta(days=1)
+    starts = [newest - timedelta(days=21 * n) for n in range(1, 6)]
+    tags = [f"v{newest:%Y%m%d}0"] + [f"v{d:%Y%m%d}0" for d in starts]
+    zips = {tags[0]: _feed_starting(rail, newest, end + timedelta(days=21))}
+    for tag, start in zip(tags[1:], starts):
+        zips[tag] = _feed_starting(rail, start, start + timedelta(days=20))
+
+    def download(self, urls):
+        downloads.append(urls)
+        tag = next((t for t in zips if t in urls[0]), tags[0])
+        return zips[tag], urls[0]
+
+    monkeypatch.setattr(gtfs.FeedManager, "_download", download)
+    monkeypatch.setattr(gtfs.FeedManager, "_release_tags", lambda self: tags)
+    return fm, downloads, data, today, starts
+
+
+def test_fresh_cache_downloads_todays_timetable_when_newest_isnt_in_effect(releases):
+    # Newest feed published early and no cached feed it replaced: e.g. a new instance.
+    fm, downloads, data, today, starts = releases
+    s, e = fm.get().feed_range()
+    assert (s, e) == (starts[0], starts[0] + timedelta(days=20)) and s <= today <= e
+    assert len(downloads) == 2 and gtfs.RELEASE_ZIP.format(tag=f"v{s:%Y%m%d}0") in downloads[1]
+    fm.get()
+    assert len(downloads) == 2  # cached
+    assert fm.get(today + timedelta(days=1)).feed_range()[0] == today + timedelta(days=1)
+
+
+def test_past_day_uses_the_release_in_effect_then(releases):
+    fm, downloads, data, today, starts = releases
+    day = starts[2] + timedelta(days=3)
+    assert fm.get(day).feed_range()[0] == starts[2]
+    assert (data / f"google_rail_v{starts[2]:%Y%m%d}0.zip").exists()
+
+
+def test_old_releases_are_pruned(releases):
+    fm, downloads, data, today, starts = releases
+    for start in reversed(starts):
+        fm.get(start)
+    kept = sorted(p.name for p in data.glob("google_rail_v*.zip"))
+    assert len(kept) == gtfs.MAX_RELEASE_SLOTS
+    assert f"google_rail_v{starts[-1]:%Y%m%d}0.zip" not in kept  # least recently used
+    assert fm.get(starts[0]).feed_range()[0] == starts[0]
+
+
+def test_no_release_list_falls_back_to_newest_feed_without_retrying(releases, monkeypatch):
+    fm, downloads, data, today, starts = releases
+    calls = []
+    monkeypatch.setattr(gtfs.FeedManager, "_tags_from_git", lambda self: calls.append(1) or 1 / 0)
+    monkeypatch.setattr(gtfs.FeedManager, "_tags_from_api", lambda self: calls.append(1) or 1 / 0)
+    monkeypatch.setattr(gtfs.FeedManager, "_release_tags", _real_release_tags)  # unlike the fixture
+    assert fm.get().feed_range()[0] == today + timedelta(days=1)  # best it has
+    fm.get()
+    assert len(calls) == 2  # not again for 15 minutes
 
 
 def test_refresh_feeds_cli(monkeypatch):
