@@ -160,10 +160,11 @@ about 12 MB together; processing a download takes 10–15 seconds. It re-checks 
 SEPTA announces timetable changes well ahead, and sooner if the cached timetable runs out.
 `septa-mcp --refresh-feeds` downloads the newest feeds into the cache and exits, for running
 on a schedule instead. SEPTA publishes a new feed every few weeks,
-a few days before it takes effect, and its download link switches to it right away; until the
-new feed starts, the server also keeps the one in effect (from the GitHub releases) and answers
-each date from the feed that covers it. Results include `valid_from`/`valid_until`, and a
-warning if you ask about a date outside it.
+a few days before it takes effect, and its download link switches to it right away. For a date
+before the newest feed starts (today, until the switch, or a past date), the server uses the
+cached feed that was in effect, or downloads the GitHub release in effect that date and keeps
+the last few it used (about 12 MB each). Results include `valid_from`/`valid_until`, and a
+warning if you ask about a date no feed covers.
 A feed's version is named for its start date, and SEPTA folds later schedule changes into the
 same feed, so results also list `timetable_changes_included` to show the data is current.
 

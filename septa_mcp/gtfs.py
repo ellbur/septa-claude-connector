@@ -927,10 +927,23 @@ FEED_NAMES = {"rail": "Regional Rail", "metro": "Metro (subway and trolley)", "b
 CACHE_FORMAT = 2
 
 # SEPTA's download URLs only ever have the newest feed, which it publishes a few days
-# before that feed starts. Until then, the feed in effect is the cached one that newest
-# feed replaced, or failing that the matching GitHub release.
-RELEASES_API = "https://api.github.com/repos/septadev/GTFS/releases?per_page=30"
+# before that feed starts. Other days need an older feed: the cached one that newest feed
+# replaced, or the GitHub release that covers the day. Releases are tagged
+# v<start date><revision> (v202609271 = second revision of the feed starting 9/27) and
+# listed from git's tag list, which isn't rate-limited like GitHub's REST API (60
+# unauthenticated requests an hour, which Cloud Run's shared addresses run into); the
+# REST API is the fallback.
+RELEASE_REFS = "https://github.com/septadev/GTFS.git/info/refs?service=git-upload-pack"
+RELEASES_API = "https://api.github.com/repos/septadev/GTFS/releases?per_page=100"
 RELEASE_ZIP = "https://github.com/septadev/GTFS/releases/download/{tag}/gtfs_public.zip"
+RELEASE_TAG = re.compile(r"v(\d{8})(\d+)")
+# Release feeds kept on disk besides the newest one (about 12 MB each), most recently used first.
+MAX_RELEASE_SLOTS = 4
+
+
+def _tag_key(tag: str) -> tuple[str, int]:
+    m = RELEASE_TAG.fullmatch(tag)
+    return m.group(1), int(m.group(2))
 
 
 def _today() -> date:
@@ -941,11 +954,13 @@ class FeedManager:
     """Keeps current rail, Metro and bus feeds, refreshing the cached zips when they get
     stale.
 
-    Normally that's just the newest feeds. When the newest ones haven't started yet, it
-    also keeps the ones in effect today, so dates before the switch still have a timetable.
-    Each download is cached as one zip per kind (google_rail.zip, google_metro.zip,
-    google_bus.zip) plus a source.json naming where it came from; the "_in_effect" set has
-    the same files with that suffix. Feeds are parsed the first time they're asked for.
+    Normally that's just the newest feeds. For a day before they start (SEPTA publishes
+    them days early, or the day is past) it uses the cached feeds they replaced, the
+    "_in_effect" set, or else downloads the release in effect that day from GitHub and
+    keeps a few such releases. Each download is cached as one zip per kind
+    (google_rail.zip, google_metro.zip, google_bus.zip) plus a source.json naming where it
+    came from; other sets have the same files with a suffix ("_in_effect", "_v202609271").
+    Feeds are parsed the first time they're asked for.
     """
 
     def __init__(
@@ -967,6 +982,8 @@ class FeedManager:
         self._local: dict[str, bytes] | None = None
         self._lock = threading.Lock()
         self._last_attempt: dict[str, float] = {}
+        self._tags: list[str] | None = None
+        self._tags_at = 0.0
 
     def _path(self, slot: str, kind: str) -> Path:
         return self.data_dir / f"google_{kind}{slot}.zip"
@@ -989,22 +1006,105 @@ class FeedManager:
                 log.warning("GTFS download failed from %s: %s", url, e)
         raise RuntimeError("Could not download SEPTA GTFS. " + "; ".join(errors))
 
-    def _in_effect_urls(self, today: date) -> list[str]:
-        """Download URL of the newest released feed that has started by `today`."""
+    def _tags_from_git(self) -> list[str]:
+        req = urllib.request.Request(RELEASE_REFS, headers={"User-Agent": "git/2 " + USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode("utf-8", "replace")
+        return sorted(set(re.findall(r"refs/tags/(v\d{9,})(?![\w.-])", body)))
+
+    def _tags_from_api(self) -> list[str]:
         req = urllib.request.Request(RELEASES_API, headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             releases = json.load(resp)
-        # Tags are v<start date><revision>, e.g. v202609271 = second revision of the 9/27 feed.
-        started = [
-            (m.group(1), int(m.group(2)), r["tag_name"])
-            for r in releases
-            if not r.get("draft") and not r.get("prerelease")
-            if (m := re.fullmatch(r"v(\d{8})(\d+)", r.get("tag_name", "")))
-            if m.group(1) <= today.strftime("%Y%m%d")
-        ]
-        if not started:
-            raise RuntimeError("No SEPTA GTFS release found that has started yet")
-        return [RELEASE_ZIP.format(tag=max(started)[2])]
+        return [r["tag_name"] for r in releases if not r.get("draft") and not r.get("prerelease")]
+
+    def _release_tags(self) -> list[str]:
+        """Tags of SEPTA's feed releases, newest start first (cached for an hour)."""
+        now = time.time()
+        if self._tags is not None and now - self._tags_at < 3600:
+            return self._tags
+        if now - self._last_attempt.get("releases", 0) <= 900:  # don't hammer
+            raise RuntimeError("Listing SEPTA's GTFS releases failed recently; retrying later")
+        self._last_attempt["releases"] = now
+        errors = []
+        for fetch in (self._tags_from_git, self._tags_from_api):
+            try:
+                tags = fetch()
+                break
+            except Exception as e:  # noqa: BLE001 - try the other listing
+                errors.append(f"{e}")
+        else:
+            raise RuntimeError("Could not list SEPTA's GTFS releases: " + "; ".join(errors))
+        self._tags = sorted((t for t in tags if RELEASE_TAG.fullmatch(t)), key=_tag_key, reverse=True)
+        self._tags_at = time.time()
+        return self._tags
+
+    def _releases_for(self, day: date) -> list[str]:
+        """Release tags that had started by `day`, newest first: the first is the feed in
+        effect that day."""
+        return [t for t in self._release_tags() if _tag_key(t)[0] <= day.strftime("%Y%m%d")]
+
+    def _cached_release_slots(self) -> list[str]:
+        """Slots of the release feeds on disk, most recently used first."""
+        slots = [p.stem[len("google_rail"):] for p in self.data_dir.glob("google_rail_v*.zip")]
+        slots = [s for s in slots if RELEASE_TAG.fullmatch(s[1:])]
+
+        def used(slot):
+            meta = self.data_dir / f"source{slot}.json"
+            return (meta if meta.exists() else self._path(slot, "rail")).stat().st_mtime
+
+        return sorted(slots, key=used, reverse=True)
+
+    def _fetch_release(self, tag: str, raise_errors: bool = False) -> bool:
+        """Download release `tag` into its own slot unless it's already there (a released
+        feed never changes). Returns whether the slot has it."""
+        slot = f"_{tag}"
+        if self._path(slot, "rail").exists() and (self._meta(slot) or {}).get("format") == CACHE_FORMAT:
+            return True
+        try:
+            self._refresh(slot, lambda: [RELEASE_ZIP.format(tag=tag)], force=True, raise_errors=raise_errors)
+        except Exception:
+            if raise_errors:
+                raise
+            log.exception("Could not download SEPTA's %s feed", tag)
+        if not self._path(slot, "rail").exists():
+            return False
+        self._prune_releases(keep=slot)
+        return True
+
+    def _prune_releases(self, keep: str) -> None:
+        for slot in [s for s in self._cached_release_slots() if s != keep][MAX_RELEASE_SLOTS - 1:]:
+            for kind in FEED_NAMES:
+                self._path(slot, kind).unlink(missing_ok=True)
+                self._feeds.pop((slot, kind), None)
+            (self.data_dir / f"source{slot}.json").unlink(missing_ok=True)
+
+    def _release_feed(self, day: date, kind: str, raise_errors: bool = False):
+        """The `kind` feed of the release in effect on `day`, downloading it if needed, or
+        None. Without the release list, the best cached release."""
+        try:
+            tags = self._releases_for(day)
+        except Exception:
+            if raise_errors:
+                raise
+            log.exception("Could not list SEPTA's GTFS releases")
+            tags = None
+        if tags is None:
+            ymd = day.strftime("%Y%m%d")
+            cached = [s[1:] for s in self._cached_release_slots() if _tag_key(s[1:])[0] <= ymd]
+            candidates = sorted(cached, key=_tag_key, reverse=True)[:1]
+        else:
+            candidates = tags[:2]  # the newest might be a tag without a feed attached
+        for tag in candidates:
+            if tags is not None and not self._fetch_release(tag, raise_errors=raise_errors):
+                continue
+            feed = self._load(f"_{tag}", kind)
+            if feed is not None and _covers(feed.feed_range(), day):
+                meta = self.data_dir / f"source_{tag}.json"
+                if meta.exists():
+                    os.utime(meta)  # most recently used (not the zip: that would re-parse it)
+                return feed
+        return None
 
     def _refresh(self, slot: str, urls, force: bool = False, raise_errors: bool = False) -> bool:
         """Re-download slot's feeds from urls() when older than max_age, when cached in an
@@ -1086,7 +1186,7 @@ class FeedManager:
             start, _ = self._load("", "rail").feed_range()
             today = _today()
             if start and start > today and not self._slot_covers("_in_effect", today):
-                self._refresh("_in_effect", lambda: self._in_effect_urls(today), force=True, raise_errors=True)
+                self._release_feed(today, "rail", raise_errors=True)
 
     def _load(self, slot: str, kind: str) -> RailFeed | None:
         """The parsed feed cached for (slot, kind), re-parsed when the file is newer."""
@@ -1130,23 +1230,13 @@ class FeedManager:
                 if (self._meta("") or {}).get("format") != CACHE_FORMAT:  # old cache, and the refresh failed
                     raise FeedUnavailable(f"The {FEED_NAMES[kind]} schedule isn't downloaded yet; retrying later.")
                 raise FeedUnavailable(f"SEPTA's download had no {FEED_NAMES[kind]} schedule.")
-            feeds = [latest]
-            start, _ = latest.feed_range()
-            if start and start > today:
-                # A released feed never changes, so the cached one is good until it's superseded.
-                in_effect = None
-                try:
-                    self._refresh("_in_effect", lambda: self._in_effect_urls(today))
-                    in_effect = self._load("_in_effect", kind)
-                except Exception:  # noqa: BLE001
-                    log.exception("Could not get the feed in effect before %s", start)
-                if in_effect:
-                    s, e = in_effect.feed_range()
-                    if s and s <= today and (not e or today <= e):
-                        feeds.append(in_effect)
             day = day or today
-            for f in feeds:
-                s, e = f.feed_range()
-                if s and e and s <= day <= e:
-                    return f
-            return latest
+            start, _ = latest.feed_range()
+            if _covers(latest.feed_range(), day) or not start or day > start:
+                return latest  # (past its end, no older feed has the day either)
+            # Before the newest feed starts (SEPTA publishes it days early, or `day` is in the
+            # past): the cached feed it replaced, else the release in effect that day.
+            in_effect = self._load("_in_effect", kind)
+            if in_effect is not None and _covers(in_effect.feed_range(), day):
+                return in_effect
+            return self._release_feed(day, kind) or latest
