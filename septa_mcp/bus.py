@@ -27,7 +27,16 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
 
-from .gtfs import AmbiguousStation, ServiceCalendar, StationNotFound, _to_dt, fmt_time_on, normalize
+from .gtfs import (
+    OVERNIGHT_FROM,
+    OVERNIGHT_PREFIX,
+    AmbiguousStation,
+    ServiceCalendar,
+    StationNotFound,
+    _to_dt,
+    fmt_time_on,
+    normalize,
+)
 
 # GTFS route_types kept: 3 = bus, 11 = trackless trolley (SEPTA's 59, 66 and 75).
 BUS_ROUTE_TYPES = {"3", "11"}
@@ -492,6 +501,54 @@ class BusFeed(ServiceCalendar):
         if d not in self._services:
             self._services[d] = super().services_on(d)
         return self._services[d]
+
+    def add_overnight(self, prev: "BusFeed", day: date) -> int:
+        """RailFeed.add_overnight for buses: copy in prev's late trips of service day `day`."""
+        if self.services_on(day):
+            return 0
+        active = prev.services_on(day)
+        added: list[tuple[BusTrip, list[tuple[int, int, int, int]]]] = []
+        mine = {t.trip_id for t in self.trips}
+        for ti, t in enumerate(prev.trips):
+            first, n = prev.trip_first[ti], prev.trip_count[ti]
+            if t.service_id not in active or not n or prev.st_time[first + n - 1] < OVERNIGHT_FROM:
+                continue
+            times = []
+            for p in range(first, first + n):
+                s = self.stop_index.get(prev.stop_rows[prev.st_stop[p]]["stop_id"])
+                if s is not None:
+                    times.append((s, prev.st_time[p], prev.st_seq[p], prev.st_flags[p]))
+            if len(times) < 2:
+                continue
+            tid = t.trip_id if t.trip_id not in mine else OVERNIGHT_PREFIX + t.trip_id
+            sid = OVERNIGHT_PREFIX + t.service_id
+            self.cal_add.setdefault(sid, set()).add(day)
+            if t.route_id not in self.routes and t.route_id in prev.routes:
+                self.routes[t.route_id] = prev.routes[t.route_id]
+            added.append((BusTrip(tid, t.route_id, sid, t.headsign, t.direction_id), times))
+        if not added:
+            return 0
+        extra: dict[int, list[int]] = defaultdict(list)
+        for trip, times in added:
+            ti = len(self.trips)
+            self.trips.append(trip)
+            self.trip_first.append(len(self.st_trip))
+            self.trip_count.append(len(times))
+            for s, t, seq, flags in times:
+                extra[s].append(len(self.st_trip))
+                self.st_trip.append(ti)
+                self.st_stop.append(s)
+                self.st_time.append(t)
+                self.st_seq.append(seq)
+                self.st_flags.append(flags)
+        pos, starts = array("i"), array("i", [0])
+        for s in range(len(self.stop_pos_start) - 1):
+            pos.extend(self.stop_pos[self.stop_pos_start[s]:self.stop_pos_start[s + 1]])
+            pos.extend(extra.get(s, ()))
+            starts.append(len(pos))
+        self.stop_pos, self.stop_pos_start = pos, starts
+        self._services.clear()
+        return len(added)
 
     def departures(
         self, corner: BusStop, start: datetime, end: datetime, routes: set[str] | None = None

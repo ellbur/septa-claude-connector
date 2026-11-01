@@ -1106,6 +1106,70 @@ def test_transit_view_all():
     assert len(by_route["T1"]) == 2  # the stale one is dropped here too
 
 
+
+def test_stale_vehicle_reports_across_the_fall_back_hour():
+    """1:10 AM EST is 20 minutes after 1:50 AM EDT, though the clock reads 40 minutes earlier."""
+    now = datetime(2026, 11, 1, 1, 10, fold=1, tzinfo=server.TZ)
+    at = lambda h, m, fold: int(datetime(2026, 11, 1, h, m, fold=fold, tzinfo=server.TZ).timestamp())
+    vehicles = [{"label": "old", "timestamp": at(1, 50, 0)}, {"label": "new", "timestamp": at(1, 8, 1)}]
+    assert [v["vehicle"] for v in realtime._vehicles(vehicles, now)] == ["new"]
+
+
+# -- A new timetable's first night -------------------------------------------------
+
+
+def _departures(feed, kind, ws, we) -> set:
+    if kind == "bus":
+        return {(dt, feed.trips[ti].route_id, feed.stop_rows[feed.st_stop[p]]["stop_id"])
+                for c in feed.corners for dt, ti, p in feed.departures(c, ws, we)}
+    if kind == "metro":
+        return {(dt, t.route_id, s.stop_id) for s in feed.stops.values() for dt, t, _ in feed.departures(s, ws, we)}
+    return {(d["depart"], d["train"], s.stop_id) for s in feed.stops.values() for d in feed.departures(s, ws, we)}
+
+
+@pytest.mark.parametrize("kind", ["rail", "metro", "bus"])
+def test_new_feed_keeps_the_late_trips_of_the_night_before(kind):
+    """A feed starting Sunday lacks Saturday's trips that run after midnight; add_overnight
+    copies them in from the feed before."""
+    if server.feeds.local_zip:
+        pytest.skip("needs the downloaded feeds")
+    blob = server.feeds._path("", kind).read_bytes()
+    prev, new = gtfs._parse(kind, blob, "", 0), gtfs._parse(kind, blob, "", 0)
+    for table in (new.calendar, new.cal_add, new.cal_remove):
+        table.clear()  # a feed that hasn't started: no Saturday, no Sunday
+    if kind == "bus":
+        new._services.clear()
+    sat = next_weekday(5)
+    ws = datetime.combine(sat + timedelta(days=1), dtime(0, 0), server.TZ)
+    we = ws + timedelta(hours=4)
+    assert not _departures(new, kind, ws, we)
+    n = new.add_overnight(prev, sat)
+    after = _departures(new, kind, ws, we)
+    if kind == "rail" and not n:
+        pytest.skip("no Saturday train runs past 10 PM in this feed")
+    assert n and after and after <= _departures(prev, kind, ws, we)
+
+
+_real_add_overnight = gtfs.FeedManager._add_overnight
+
+
+def test_first_day_of_a_feed_adds_the_night_befores_trips(fresh_manager, monkeypatch):
+    fm, downloads, data = fresh_manager
+    today, end = fm.get().feed_range()
+    rail = server.feeds._path("", "rail").read_bytes()
+    before = gtfs.RailFeed(_feed_starting(rail, today - timedelta(days=21), end))
+    added = []
+    monkeypatch.setattr(gtfs.FeedManager, "_add_overnight", _real_add_overnight)
+    monkeypatch.setattr(gtfs.FeedManager, "_release_feed", lambda self, day, kind: before)
+    monkeypatch.setattr(gtfs.RailFeed, "add_overnight", lambda self, prev, day: added.append((prev, day)) or 0)
+    fm._feeds.clear()
+    feed = fm.get()
+    assert added == [(before, today - timedelta(days=1))]
+    assert fm.get() is feed and len(added) == 1  # once
+    fm.get(today + timedelta(days=1))
+    assert len(added) == 1  # not the feed's first day
+
+
 # -- Timetable refreshes ---------------------------------------------------------
 
 
@@ -1125,6 +1189,8 @@ def fresh_manager(tmp_path, monkeypatch):
     monkeypatch.delenv("SEPTA_GTFS_MAX_AGE_HOURS", raising=False)
     start, _ = gtfs.RailFeed(rail).feed_range()
     monkeypatch.setattr(gtfs, "_today", lambda: start)  # no "in effect" feed needed
+    # Nor the late trips from the night before it (see test_first_day_of_a_feed_adds_...).
+    monkeypatch.setattr(gtfs.FeedManager, "_add_overnight", lambda self, *a: None)
     return gtfs.FeedManager(data_dir=tmp_path), downloads, tmp_path
 
 

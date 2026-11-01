@@ -232,6 +232,8 @@ class ServiceCalendar:
         self.cal_add: dict[str, set[date]] = {}
         self.cal_remove: dict[str, set[date]] = {}
         self.feed_info: dict = {}
+        # Service days whose late trips were copied in from the feed before this one.
+        self.overnight_added: set[date] = set()
 
     def _read_calendar(self, rows) -> None:
         """Load calendar.txt, calendar_dates.txt and feed_info.txt via rows(fname)."""
@@ -304,6 +306,13 @@ class ServiceCalendar:
             if d in ds:
                 active.discard(sid)
         return active
+
+
+# A feed's first day starts with the previous feed's late trips still running (see
+# add_overnight): those of its last service day still running at this time of night,
+# which covers the 45-minute look-back of the departure boards.
+OVERNIGHT_FROM = 22 * 3600
+OVERNIGHT_PREFIX = "prev:"
 
 
 def _zip_rows(z: zipfile.ZipFile, fname: str) -> list[dict]:
@@ -422,6 +431,58 @@ class RailFeed(ServiceCalendar):
         for t in self.trips.values():
             for i, st in enumerate(t.times):
                 self.stop_index.setdefault(st.stop_id, []).append((t, i))
+
+    def add_overnight(self, prev: "RailFeed", day: date) -> int:
+        """Copy in prev's trips of service day `day` that run late into the night (past
+        OVERNIGHT_FROM), for a feed that starts the next day. Those trips run after
+        midnight on this feed's first day, but only the feed they belong to has them, so
+        without this they'd vanish from answers at midnight. Returns how many were added."""
+        if self.services_on(day):  # this feed has that day itself
+            return 0
+        active = prev.services_on(day)
+        platforms = getattr(prev, "platforms", {})
+
+        def stop_here(sid: str) -> str | None:
+            for raw in platforms.get(sid, [sid]):
+                mine = self.stop_alias.get(raw, raw)
+                if mine in self.stops:
+                    return mine
+            return None
+
+        renamed: dict[str, str] = {}
+        for t in prev.trips.values():
+            if t.service_id not in active or not t.times or t.times[-1].arr < OVERNIGHT_FROM:
+                continue
+            times: list[StopTime] = []
+            for st in t.times:
+                sid = stop_here(st.stop_id)
+                if sid is None:
+                    continue
+                if times and times[-1].stop_id == sid:  # two platforms of one station in a row
+                    times[-1].dep, times[-1].pickup = st.dep, times[-1].pickup or st.pickup
+                    continue
+                times.append(StopTime(sid, st.seq, st.arr, st.dep, st.pickup, st.dropoff))
+            if len(times) < 2:
+                continue
+            # Keep the trip_id (live vehicle data names trips by it) unless this feed uses it.
+            tid = t.trip_id if t.trip_id not in self.trips else OVERNIGHT_PREFIX + t.trip_id
+            renamed[t.trip_id] = tid
+            sid = OVERNIGHT_PREFIX + t.service_id
+            self.cal_add.setdefault(sid, set()).add(day)
+            if t.route_id not in self.routes and t.route_id in prev.routes:
+                self.routes[t.route_id] = prev.routes[t.route_id]
+            trip = Trip(tid, t.route_id, sid, t.headsign, t.train, t.direction_id, times)
+            self.trips[tid] = trip
+            for i, st in enumerate(times):
+                self.stop_index.setdefault(st.stop_id, []).append((trip, i))
+                self.stops[st.stop_id].routes.add(t.route_id)
+        for old, new in renamed.items():
+            nxt = prev.next_trip.get(old)
+            if nxt in renamed:
+                self.next_trip[new] = renamed[nxt]
+                self.prev_trip[renamed[nxt]] = new
+        self._between_cache.clear()
+        return len(renamed)
 
     def _merge_platforms(self, parents: dict[str, str]) -> None:
         """Hook for feeds whose stations are split into several stops (see MetroFeed);
@@ -1231,12 +1292,31 @@ class FeedManager:
                     raise FeedUnavailable(f"The {FEED_NAMES[kind]} schedule isn't downloaded yet; retrying later.")
                 raise FeedUnavailable(f"SEPTA's download had no {FEED_NAMES[kind]} schedule.")
             day = day or today
-            start, _ = latest.feed_range()
-            if _covers(latest.feed_range(), day) or not start or day > start:
-                return latest  # (past its end, no older feed has the day either)
-            # Before the newest feed starts (SEPTA publishes it days early, or `day` is in the
-            # past): the cached feed it replaced, else the release in effect that day.
-            in_effect = self._load("_in_effect", kind)
-            if in_effect is not None and _covers(in_effect.feed_range(), day):
-                return in_effect
-            return self._release_feed(day, kind) or latest
+            feed = self._for_day(latest, day, kind)
+            if feed.feed_range()[0] == day and day not in feed.overnight_added:
+                feed.overnight_added.add(day)
+                self._add_overnight(feed, latest, day, kind)
+            return feed
+
+    def _add_overnight(self, feed, latest, day: date, kind: str) -> None:
+        """On a feed's first day, add the late trips of the night before from the feed in
+        effect then (see RailFeed.add_overnight)."""
+        eve = day - timedelta(days=1)
+        try:
+            prev = self._for_day(latest, eve, kind)
+            if prev is not feed and _covers(prev.feed_range(), eve):
+                n = feed.add_overnight(prev, eve)
+                log.info("Added %d late %s trips of %s from the feed before", n, kind, eve)
+        except Exception:  # noqa: BLE001 - the day's own trips still work
+            log.exception("Could not add the late %s trips of %s from the feed before", kind, eve)
+
+    def _for_day(self, latest, day: date, kind: str):
+        start, _ = latest.feed_range()
+        if _covers(latest.feed_range(), day) or not start or day > start:
+            return latest  # (past its end, no older feed has the day either)
+        # Before the newest feed starts (SEPTA publishes it days early, or `day` is in the
+        # past): the cached feed it replaced, else the release in effect that day.
+        in_effect = self._load("_in_effect", kind)
+        if in_effect is not None and _covers(in_effect.feed_range(), day):
+            return in_effect
+        return self._release_feed(day, kind) or latest

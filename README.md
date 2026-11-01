@@ -163,7 +163,9 @@ on a schedule instead. SEPTA publishes a new feed every few weeks,
 a few days before it takes effect, and its download link switches to it right away. For a date
 before the newest feed starts (today, until the switch, or a past date), the server uses the
 cached feed that was in effect, or downloads the GitHub release in effect that date and keeps
-the last few it used (about 12 MB each). Results include `valid_from`/`valid_until`, and a
+the last few it used (about 12 MB each). On a feed's first day it also adds the previous
+feed's trips from the night before that are still running after midnight, which only that
+feed has. Results include `valid_from`/`valid_until`, and a
 warning if you ask about a date no feed covers.
 A feed's version is named for its start date, and SEPTA folds later schedule changes into the
 same feed, so results also list `timetable_changes_included` to show the data is current.
