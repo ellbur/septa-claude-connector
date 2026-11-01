@@ -527,7 +527,8 @@ def _vehicles(vehicles: Any, now: datetime) -> list[dict]:
             reported = datetime.fromtimestamp(int(v.get("timestamp")), TZ)
         except (TypeError, ValueError):
             reported = None
-        if reported and now - reported > timedelta(minutes=STALE_REPORT_MINUTES):
+        # Elapsed time, not clock difference: the two can straddle the fall-back hour.
+        if reported and now.timestamp() - reported.timestamp() > STALE_REPORT_MINUTES * 60:
             continue
         try:
             late = int(v.get("late"))
