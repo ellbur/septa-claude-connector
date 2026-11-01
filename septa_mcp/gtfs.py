@@ -306,6 +306,26 @@ class ServiceCalendar:
         return active
 
 
+def _zip_rows(z: zipfile.ZipFile, fname: str) -> list[dict]:
+    if fname not in z.namelist():
+        return []
+    with z.open(fname) as fh:
+        return list(csv.DictReader(io.TextIOWrapper(fh, encoding="utf-8-sig", newline="")))
+
+
+def feed_range_of(gtfs_zip: bytes) -> tuple[date | None, date | None]:
+    """The dates a GTFS zip covers, read from its calendar alone (no stops or trips)."""
+    cal = ServiceCalendar()
+    with zipfile.ZipFile(io.BytesIO(gtfs_zip)) as z:
+        cal._read_calendar(lambda fname: _zip_rows(z, fname))
+    return cal.feed_range()
+
+
+def _covers(rng: tuple[date | None, date | None], day: date) -> bool:
+    start, end = rng
+    return bool(start) and start <= day and (not end or day <= end)
+
+
 class RailFeed(ServiceCalendar):
     # What resolve_station looks up (for error messages), and the names riders use for it.
     KIND = "Regional Rail station"
@@ -907,7 +927,8 @@ FEED_NAMES = {"rail": "Regional Rail", "metro": "Metro (subway and trolley)", "b
 CACHE_FORMAT = 2
 
 # SEPTA's download URLs only ever have the newest feed, which it publishes a few days
-# before that feed starts. Until then, the feed in effect comes from the GitHub releases.
+# before that feed starts. Until then, the feed in effect is the cached one that newest
+# feed replaced, or failing that the matching GitHub release.
 RELEASES_API = "https://api.github.com/repos/septadev/GTFS/releases?per_page=30"
 RELEASE_ZIP = "https://github.com/septadev/GTFS/releases/download/{tag}/gtfs_public.zip"
 
@@ -1004,6 +1025,8 @@ class FeedManager:
             blob, url = self._download(urls())
             feeds = _extract_feeds(blob)
             self.data_dir.mkdir(parents=True, exist_ok=True)
+            if slot == "":
+                self._keep_in_effect(feeds)
             for kind in FEED_NAMES:
                 path = self._path(slot, kind)
                 if kind in feeds:
@@ -1023,6 +1046,38 @@ class FeedManager:
             log.exception("Refresh of the%s feed failed; using cached feed", slot.replace("_", " "))
             return False
 
+    def _slot_covers(self, slot: str, day: date) -> bool:
+        rail = self._path(slot, "rail")
+        try:
+            return rail.exists() and _covers(feed_range_of(rail.read_bytes()), day)
+        except (OSError, zipfile.BadZipFile, KeyError, ValueError):
+            return False
+
+    def _keep_in_effect(self, new: dict[str, bytes]) -> None:
+        """Before new feeds replace the cached ones: if the new timetable hasn't started yet,
+        the cached one is still the one in effect today, so keep it as the "_in_effect"
+        set (unless that already covers today). SEPTA publishes each feed days before it
+        starts, and looking up the in-effect release on GitHub can fail (its API rate-limits
+        unauthenticated requests, which Cloud Run's shared addresses run into), which left
+        no timetable for today."""
+        today = _today()
+        if "rail" not in new or _covers(feed_range_of(new["rail"]), today):
+            return
+        if self._slot_covers("_in_effect", today) or not self._slot_covers("", today):
+            return
+        for kind in FEED_NAMES:
+            src, dst = self._path("", kind), self._path("_in_effect", kind)
+            if src.exists():
+                tmp = dst.with_suffix(".tmp")
+                tmp.write_bytes(src.read_bytes())
+                tmp.replace(dst)
+            else:
+                dst.unlink(missing_ok=True)
+        meta = self.data_dir / "source.json"
+        if meta.exists():
+            (self.data_dir / "source_in_effect.json").write_text(meta.read_text())
+        log.info("Kept the cached feeds as the ones in effect until the new feed starts")
+
     def refresh(self) -> None:
         """Download the newest feeds now, whatever the cache's age, plus the ones in effect
         today if the newest haven't started: for a scheduled job. Raises if a download fails."""
@@ -1030,7 +1085,7 @@ class FeedManager:
             self._refresh("", lambda: self.urls, force=True, raise_errors=True)
             start, _ = self._load("", "rail").feed_range()
             today = _today()
-            if start and start > today:
+            if start and start > today and not self._slot_covers("_in_effect", today):
                 self._refresh("_in_effect", lambda: self._in_effect_urls(today), force=True, raise_errors=True)
 
     def _load(self, slot: str, kind: str) -> RailFeed | None:
