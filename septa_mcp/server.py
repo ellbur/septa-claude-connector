@@ -79,10 +79,13 @@ the trolleys T1-T5, G1, D1, D2; and the M1 Norristown High Speed Line) and buses
   30th St, Jefferson Station <-> 13th St or 8th-Market (short walks), Fern Rock and
   Norristown Transit Centers.
 - Bus stops are corners, named by cross streets in either order, or by the stop number
-  on the sign. Results name the corner (board_at) and the stop there the bus leaves from
-  (board_stop: which side of the street, and board_stop_id, its number); tell riders
-  which side when it matters. bus_schedule only finds buses that go directly; for a trip
-  that needs a change, plan the legs separately via a corner both routes serve.
+  on the sign. Results name the intersection (board_at) and the stop there the bus leaves
+  from: board_stop_id, the number on its sign, and board_stop_where, which corner it's on
+  ("northeast corner (north side of Lombard St, just east of Broad St; near side), for
+  westbound buses"). Tell riders the corner when they ask where to wait. It's worked out
+  from stop coordinates and the way buses run; if it's missing, say you can't tell.
+  bus_schedule only finds buses that go directly; for a trip that needs a change, plan
+  the legs separately via a corner both routes serve.
 All times are America/New_York local time. Not covered: NJ Transit, PATCO and Amtrak.
 """
 
@@ -1376,11 +1379,20 @@ def _bus_alerts(feed, routes: set[str]) -> dict:
 
 
 def _corner_dict(feed, corner) -> dict:
+    stops = []
+    for i in corner.stops:
+        row = feed.stop_rows[i]
+        s = {"stop_id": row["stop_id"], "name": row["stop_name"], "routes": feed.routes_label(row.get("routes", "").split())}
+        where = feed.where(i)
+        if where:
+            s["where"] = where
+        stops.append(s)
     return {
         "name": corner.name,
         "stop_id": corner.stop_id,
         "routes": feed.routes_label(corner.routes),
         "wheelchair_accessible": corner.wheelchair,
+        "stops_here": stops,
     }
 
 
@@ -1389,8 +1401,9 @@ def find_bus_stop(query: str, route: str | None = None) -> dict:
     """Look up SEPTA bus stops, optionally on one route ("42", "K").
 
     query: cross streets in either order ("Broad and Walnut", "Walnut St & Broad St"), one
-    street ("Chelten Av"), or the stop number on the sign ("stop 10266"). Each result is a
-    corner, with the routes stopping on any side of it.
+    street ("Chelten Av"), or the stop number on the sign ("stop 10266"). Each result is an
+    intersection, with the routes stopping there; stops_here lists its stops, each with the
+    corner it's on and which way its buses go (where).
     """
     try:
         feed = _bus_feed()
@@ -1423,8 +1436,8 @@ async def bus_schedule(
             ambiguous.
         max_results: Cap on trips returned.
 
-    board_at is the corner; board_stop is the stop there the bus leaves from (its name says
-    which side of the street) and board_stop_id the number on its sign. Doesn't plan trips
+    board_at is the intersection; board_stop is the stop there the bus leaves from,
+    board_stop_where which corner it's on, and board_stop_id the number on its sign. Doesn't plan trips
     that change buses: without a direct bus it lists the routes at each end. For the next
     buses with live delays, use bus_departures.
     """
@@ -1481,8 +1494,8 @@ async def bus_departures(stop: str, route: str | None = None, count: int = 10) -
 
     stop: cross streets in either order, or the stop number on the sign. route: only this
     route ("42", "K"); also picks the right stop when a name is ambiguous. Each departure
-    names the stop it leaves from (board_stop: which side of the street) and its direction
-    (toward). status is live where SEPTA has the bus ("3 min late"), else "scheduled".
+    names the stop it leaves from (board_stop, and board_stop_where: which corner) and its
+    direction (toward). status is live where SEPTA has the bus ("3 min late"), else "scheduled".
     """
     try:
         feed = _bus_feed()
@@ -1528,6 +1541,9 @@ async def bus_departures(stop: str, route: str | None = None, count: int = 10) -
             "board_stop_id": feed.stop_rows[stop_index]["stop_id"],
             "scheduled": fmt_time(sched),
         }
+        where = feed.where(stop_index)
+        if where:
+            d["board_stop_where"] = where
         if v:
             d["status"] = realtime.late_status(late) or "running, no delay estimate"
             if late:

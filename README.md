@@ -33,7 +33,7 @@ trolley and bus positions, and alerts for every mode).
 | `metro_vehicles(line)` | Live (TransitView) | Where a line's trolleys are, their next stops and how late. |
 | `find_metro_stop(query, line)` | GTFS | Resolving Metro station and trolley stop names. |
 | `bus_schedule(from_stop, to_stop, date, depart_after, depart_before, route)` | GTFS | Buses that go directly between two stops, for any day. |
-| `bus_departures(stop, route, count)` | GTFS + live (TransitViewAll) | Next buses from a stop, with live delays and which side of the street each leaves from. |
+| `bus_departures(stop, route, count)` | GTFS + live (TransitViewAll) | Next buses from a stop, with live delays and which corner each leaves from. |
 | `bus_vehicles(route)` | Live (TransitView) | Where a route's buses are and how late. |
 | `find_bus_stop(query, route)` | GTFS | Bus stops by cross streets or stop number. |
 | `service_alerts(line, mode)` | Live (Alerts + GTFS-realtime) | Advisories and detours for Regional Rail, Metro and bus routes, including closed stations, shuttle buses and platform changes. |

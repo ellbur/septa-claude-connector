@@ -193,6 +193,11 @@ class BusRide:
 # Feed suffixes saying which side of the corner a stop is on (far side, near side,
 # midblock), sometimes with a bay number or note: "- FS", "- 2 MBFS", "- MBNS layover".
 _SIDE_SUFFIX = re.compile(r"\s+-\s+(?:\d+\s+)?(?:MBFS|MBNS|MB|FS|NS)\b.*$")
+_SIDE_MARK = re.compile(r"\s-\s+(?:\d+\s+)?(MBFS|MBNS|MB|FS|NS)\b")
+# Unmarked stops are near side, unless the stops on the cross street at the corner are at
+# least this far behind (meters along the way buses go): stop coordinates are rough, and
+# the cross street's stops are off its middle by half its width.
+CROSS_STREET_CLEARLY_BEHIND = 15
 # Words that don't pick out a corner: street types, and joining words in queries.
 _STREET_WORDS = {
     "st", "av", "rd", "blvd", "dr", "ln", "pk", "pike", "pkwy", "hwy", "ct", "pl", "way", "ter", "cir", "sq",
@@ -200,6 +205,11 @@ _STREET_WORDS = {
 _JOINING_WORDS = {"and", "at", "the", "corner", "of", "stop"}
 # The number on a stop's sign (its stop_id): "10266", "#10266", "stop 10266", "stop no. 10266".
 _STOP_NUMBER = re.compile(r"(?:stop\s*(?:id|number|no\.?|#)?\s*)?#?\s*(\d+)", re.IGNORECASE)
+
+
+def _street_parts(name: str) -> list[str]:
+    """The streets in a stop's name, its own street first: "Lombard St & Broad St"."""
+    return [p.strip() for p in re.split(r"\s+(?:&|and|at)\s+", _SIDE_SUFFIX.sub("", name)) if p.strip()]
 
 
 def _corner_streets(name: str) -> frozenset[str]:
@@ -243,6 +253,7 @@ class BusFeed(ServiceCalendar):
             self._read_calendar(rows)
         self.stop_index = {s["stop_id"]: i for i, s in enumerate(self.stop_rows)}
         self._services: dict[date, set[str]] = {}
+        self._where: dict[int, str | None] = {}
         self._group_corners()
         self._route_index = {}
         for rid, r in self.routes.items():
@@ -381,6 +392,96 @@ class BusFeed(ServiceCalendar):
     def stop_name(self, stop: int) -> str:
         return self.stop_rows[stop]["stop_name"]
 
+    def where(self, stop: int) -> str | None:
+        """Which corner of the intersection a stop is on, for riders: "northeast corner
+        (north side of Lombard St, just east of Broad St), for westbound buses". None when
+        the feed doesn't show which way buses go there."""
+        if stop not in self._where:
+            spot = self.locate(stop)
+            self._where[stop] = _describe(spot) if spot else None
+        return self._where[stop]
+
+    def locate(self, stop: int) -> dict | None:
+        """Where a stop sits at its corner, worked out from the feed: the street it's on and
+        the cross street, the compass direction buses travel (heading), the side of the
+        street (buses board on their right), and whether it's before the cross street
+        (near side), past it (far side) or midblock. None when that can't be told."""
+        name = self.stop_name(stop)
+        parts = _street_parts(name)
+        if len(parts) != 2 or not float(self.stop_rows[stop].get("stop_lat") or 0):
+            return None
+        own, cross = parts
+        lat0 = float(self.stop_rows[stop]["stop_lat"])
+        sx, sy = self._xy(stop, lat0)
+        mine = normalize(own)
+
+        def on_my_street(i: int) -> bool:
+            p = _street_parts(self.stop_name(i))
+            return bool(p) and normalize(p[0]) == mine
+
+        # Which way buses go: toward the next stop and from the last one, counting only
+        # stops on this street (a bus turning here is on another street at one end).
+        dx = dy = 0.0
+        seen: set[tuple[int, int]] = set()
+        lo, hi = self.stop_pos_start[stop], self.stop_pos_start[stop + 1]
+        for k in range(lo, min(hi, lo + 200)):
+            p = self.stop_pos[k]
+            ti = self.st_trip[p]
+            prev = self.st_stop[p - 1] if p > self.trip_first[ti] else -1
+            nxt = self.st_stop[p + 1] if p < self.trip_first[ti] + self.trip_count[ti] - 1 else -1
+            if (prev, nxt) in seen:
+                continue
+            seen.add((prev, nxt))
+            segs = [(a, b) for a, b in ((prev, stop), (stop, nxt)) if -1 not in (a, b) and on_my_street(a if a != stop else b)]
+            if not segs and -1 not in (prev, nxt):
+                segs = [(prev, nxt)]
+            for a, b in segs:
+                (ax, ay), (bx, by) = self._xy(a, lat0), self._xy(b, lat0)
+                n = math.hypot(bx - ax, by - ay)
+                if n > 1:
+                    dx, dy = dx + (bx - ax) / n, dy + (by - ay) / n
+        n = math.hypot(dx, dy)
+        if n < 0.5:  # no neighbours, or buses both ways through one stop
+            return None
+        dx, dy = dx / n, dy / n
+        spot = {
+            "street": own,
+            "cross_street": cross,
+            "heading": _compass(dx, dy, diagonal=True),
+            "side": _compass(dy, -dx),  # the right of the way buses go
+        }
+
+        # Before or past the cross street. The feed marks far-side and midblock stops
+        # ("- FS", "- MBNS"), and a stop without a mark is near side (SEPTA's usual stop),
+        # unless the stops on the cross street clearly say otherwise.
+        m = _SIDE_MARK.search(name)
+        mark = m.group(1) if m else ""
+        if mark == "MB":
+            spot["position"] = "midblock"
+            return spot
+        if mark:
+            ahead = mark.endswith("NS")
+        else:
+            corner = self.corners[self.corner_of[stop]]
+            along = [
+                (x - sx) * dx + (y - sy) * dy
+                for x, y in (self._xy(i, lat0) for i in corner.stops if not on_my_street(i))
+            ]
+            mean = sum(along) / len(along) if along else 0.0
+            ahead = mean > -CROSS_STREET_CLEARLY_BEHIND
+        spot["position"] = ("midblock " if mark.startswith("MB") else "") + ("near side" if ahead else "far side")
+        # The corner is across the cross street from where buses come from (near side) or go.
+        end = _compass(*((-dx, -dy) if ahead else (dx, dy)), axis_of=spot["side"])
+        spot["of_cross_street"] = end
+        spot["corner"] = _corner_word(spot["side"], end)
+        return spot
+
+    def _xy(self, stop: int, lat0: float) -> tuple[float, float]:
+        """A stop's position in meters, east and north."""
+        r = self.stop_rows[stop]
+        lat, lon = float(r.get("stop_lat") or 0), float(r.get("stop_lon") or 0)
+        return lon * 111_000 * math.cos(math.radians(lat0)), lat * 111_000
+
     def corner_name(self, stop_id: str | None) -> str | None:
         i = self.stop_index.get(str(stop_id)) if stop_id is not None else None
         return self.corners[self.corner_of[i]].name if i is not None else None
@@ -443,6 +544,39 @@ class BusFeed(ServiceCalendar):
         return trip.headsign or self.corners[self.corner_of[self.st_stop[last]]].name
 
 
+_CARDINALS = [("north", 0, 1), ("east", 1, 0), ("south", 0, -1), ("west", -1, 0)]
+
+
+def _compass(x: float, y: float, diagonal: bool = False, axis_of: str | None = None) -> str:
+    """The compass direction nearest (x, y): "north", "east"... With diagonal, also
+    "northeast" and so on. With axis_of, only the two directions across that one's axis
+    (for a corner: north side and then east or west of the cross street)."""
+    if diagonal:
+        names = ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"]
+        return names[round(math.degrees(math.atan2(x, y)) % 360 / 45) % 8]
+    options = _CARDINALS
+    if axis_of:
+        ns = axis_of in ("north", "south")
+        options = [c for c in _CARDINALS if (c[1] != 0) == ns]
+    return max(options, key=lambda c: c[1] * x + c[2] * y)[0]
+
+
+def _corner_word(a: str, b: str) -> str:
+    ns, ew = (a, b) if a in ("north", "south") else (b, a)
+    return ns + ew
+
+
+def _describe(spot: dict) -> str:
+    buses = f"for {spot['heading']}bound buses"
+    side = f"{spot['side']} side of {spot['street']}"
+    if spot["position"] == "midblock":
+        return f"{side}, midblock near {spot['cross_street']}, {buses}"
+    off = f"{spot['of_cross_street']} of {spot['cross_street']}"
+    if spot["position"].startswith("midblock"):
+        return f"{side}, midblock {off} ({spot['position'].split(' ', 1)[1]}), {buses}"
+    return f"{spot['corner']} corner ({side}, just {off}; {spot['position']}), {buses}"
+
+
 def _route_order(short: str) -> tuple:
     m = re.match(r"(\d+)(.*)", short)
     return (0, int(m.group(1)), m.group(2)) if m else (1, 0, short)
@@ -451,13 +585,14 @@ def _route_order(short: str) -> tuple:
 def ride_to_dict(feed: BusFeed, r: BusRide, query_date: date | None = None) -> dict:
     trip = feed.trips[r.trip]
     board, alight = feed.st_stop[r.board], feed.st_stop[r.alight]
-    d = {
+    d: dict = {
         "route": feed.routes.get(trip.route_id, {}).get("route_short_name") or trip.route_id,
         "route_label": feed.route_label(trip.route_id),
         "toward": feed.toward(r.trip),
         "board_at": feed.corners[feed.corner_of[board]].name,
-        # The stop's own name says which side of the street; its id is the number on the sign.
+        # The stop's own name, which corner it's on, and the number on its sign.
         "board_stop": feed.stop_name(board),
+        "board_stop_where": feed.where(board),
         "board_stop_id": feed.stop_rows[board]["stop_id"],
         "depart": fmt_time_on(r.depart_dt, query_date),
         "get_off_at": feed.corners[feed.corner_of[alight]].name,
@@ -465,6 +600,8 @@ def ride_to_dict(feed: BusFeed, r: BusRide, query_date: date | None = None) -> d
         "duration_min": int((r.arrive_dt - r.depart_dt).total_seconds() // 60),
         "stops": r.alight - r.board - 1,
     }
+    if d["board_stop_where"] is None:
+        del d["board_stop_where"]
     if query_date and r.depart_dt.date() != query_date:
         d["depart_date"] = r.depart_dt.date().isoformat()
     summary = (
