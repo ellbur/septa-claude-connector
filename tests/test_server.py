@@ -141,6 +141,12 @@ def test_find_station():
 # -- real-time (mocked) ----------------------------------------------------------
 
 
+def last(path: str) -> dict:
+    """The query of the latest mock request to path (the board check may look up trains
+    after the board itself)."""
+    return next(q for p, q in reversed(mock_septa_api.REQUESTS) if p.startswith(path))
+
+
 def test_next_trains_live():
     mock_septa_api.REQUESTS.clear()
     r = call("next_trains", {"from_station": "Jefferson", "to_station": "Swarthmore", "count": 2})
@@ -150,23 +156,23 @@ def test_next_trains_live():
     assert r["trains"][0]["status"] == "3 min" and r["trains"][0]["direct"] is True
     assert r["trains"][0]["board_at"] == "Jefferson Station" and r["trains"][0]["get_off_at"] == "Swarthmore"
     assert "arrives at Swarthmore" in r["trains"][0]["summary"] and r["trains"][0]["summary"].endswith("(3 min late).")
-    path, q = mock_septa_api.REQUESTS[-1]
+    q = last("/api/NextToArrive")
     assert q["req1"] == ["Jefferson Station"] and q["req2"] == ["Swarthmore"]
 
 
 def test_api_station_name_translation():
     mock_septa_api.REQUESTS.clear()
     call("next_trains", {"from_station": "Temple", "to_station": "Morton"})
-    _, q = mock_septa_api.REQUESTS[-1]
+    q = last("/api/NextToArrive")
     assert q["req1"] == ["Temple U"] and q["req2"] == ["Morton"]
 
     r = call("next_trains", {"from_station": "30th Street", "to_station": "Wayne"})
     assert r["source"] == "SEPTA real-time API", r
-    _, q = mock_septa_api.REQUESTS[-1]
+    q = last("/api/NextToArrive")
     assert q["req1"] == ["30th Street Station"] and q["req2"] == ["Wayne Station"]
 
     call("station_departures", {"station": "Wayne"})
-    _, q = mock_septa_api.REQUESTS[-1]
+    q = last("/api/Arrivals")
     assert q["station"] == ["Wayne"]  # Arrivals wants the plain name
 
 
@@ -479,6 +485,112 @@ def test_next_trains_connection_names_each_legs_stations():
     assert (t["board_at"], t["get_off_at"]) == ("Wayne", "Temple University")  # API name translated
     c = t["connection"]
     assert (c["board_at"], c["get_off_at"]) == ("Temple University", "Lansdale") and "at" not in c
+
+
+# -- trains SEPTA's live board drops while they're running late ------------------
+
+
+def _dropped_setup(monkeypatch, to_station=None):
+    """A weekday morning a few minutes after `late` was due to leave Jefferson. SEPTA's
+    board lists none of the scheduled trains; `late` is running 8 minutes behind, `gone`
+    has left, though its lateness alone doesn't show it, and the rest aren't running."""
+    feed = server.feeds.get()
+    day = next_weekday(1)
+    jeff = feed.resolve_station("Jefferson")
+    start = datetime.combine(day, dtime(9, 0), server.TZ)
+    if to_station:
+        dest = feed.resolve_station(to_station)
+        deps = [{"train": r.train, "depart": r.depart_dt, "arrive": r.arrive_dt}
+                for r in feed.direct_rides(jeff, dest, start, start + timedelta(hours=3))]
+    else:
+        deps = feed.departures(jeff, start, start + timedelta(hours=3))
+    gone, late = deps[0], deps[1]
+    current = late["depart"] + timedelta(minutes=4)
+    assert current - gone["depart"] < timedelta(minutes=server.DROPPED_LOOKBACK_MIN)
+    monkeypatch.setattr(server, "now", lambda: current)
+
+    def clock(dt):
+        return gtfs.fmt_time(dt).lower()
+
+    positions = [
+        {"trainno": late["train"], "late": 8, "currentstop": "Temple U", "nextstop": "Jefferson Station",
+         "TRACK": "1", "TRACK_CHANGE": ""},
+        # Late enough that only its stop-by-stop actual time shows it left.
+        {"trainno": gone["train"], "late": int((current - gone["depart"]).total_seconds() // 60),
+         "currentstop": "Somewhere", "nextstop": "Elsewhere"},
+    ]
+    stops = {
+        late["train"]: [
+            {"station": "Jefferson Station", "scheduled": clock(late["depart"]),
+             "estimated": clock(late["depart"] + timedelta(minutes=8)), "actual": None},
+            *([{"station": "Some API Name", "scheduled": clock(late["arrive"]),
+                "estimated": clock(late["arrive"] + timedelta(minutes=7)), "actual": None}] if to_station else []),
+        ],
+        # Named differently from GTFS: found by its scheduled time.
+        gone["train"]: [{"station": "Jefferson", "scheduled": clock(gone["depart"]),
+                         "estimated": clock(gone["depart"]), "actual": clock(gone["depart"])}],
+    }
+    monkeypatch.setattr(realtime, "train_view", lambda: positions)
+    monkeypatch.setattr(realtime, "train_schedule_live", lambda t: stops.get(t, []))
+    monkeypatch.setattr(realtime, "arrivals", lambda *a: {"northbound": [], "southbound": []})
+    monkeypatch.setattr(realtime, "next_to_arrive", lambda *a: [])
+    return gone, late, current
+
+
+def test_board_check_finds_late_train_dropped_from_board(monkeypatch):
+    gone, late, current = _dropped_setup(monkeypatch)
+    r = call("station_departures", {"station": "Jefferson"})
+    listed = r["northbound"] + r["southbound"]
+    trains = {t["train"]: t for t in listed}
+    assert gone["train"] not in trains  # it has an actual departure time
+    t = trains[late["train"]]
+    assert t in r[server._bucket(late["train"])]
+    assert t["on_live_board"] is False and t["status"] == "8 min late"
+    assert t["scheduled_depart"] == gtfs.fmt_time(late["depart"])
+    assert t["expected_depart"] == gtfs.fmt_time(late["depart"] + timedelta(minutes=8))
+    assert t["current_stop"] == "Temple U" and t["track"] == "1"
+    assert "hasn't left Jefferson Station yet" in t["summary"]
+    assert "don't tell riders they've gone" in r["board_note"]
+    # Scheduled trains that aren't running (cancelled, replaced by buses) aren't guessed at.
+    assert [x["train"] for x in listed] == [late["train"]]
+
+
+def test_board_check_respects_direction(monkeypatch):
+    gone, late, _ = _dropped_setup(monkeypatch)
+    want = "N" if server._bucket(late["train"]) == "northbound" else "S"
+    other = "S" if want == "N" else "N"
+    r = call("station_departures", {"station": "Jefferson", "direction": other})
+    assert late["train"] not in [t["train"] for t in r["northbound"] + r["southbound"]]
+    r = call("station_departures", {"station": "Jefferson", "direction": want})
+    assert late["train"] in [t["train"] for t in r["northbound"] + r["southbound"]]
+
+
+def test_next_trains_finds_late_train_dropped_from_board(monkeypatch):
+    gone, late, _ = _dropped_setup(monkeypatch, to_station="Temple")
+    r = call("next_trains", {"from_station": "Jefferson", "to_station": "Temple"})
+    t = r["trains"][0]
+    assert t["train"] == late["train"] and t["on_live_board"] is False
+    assert t["get_off_at"] == "Temple University"
+    assert t["expected_arrive"] == gtfs.fmt_time(late["arrive"] + timedelta(minutes=7))
+    assert gone["train"] not in [x["train"] for x in r["trains"]]
+    assert "board_note" in r
+
+
+def test_board_check_skips_trains_on_the_board(monkeypatch):
+    _, late, _ = _dropped_setup(monkeypatch)
+    lookups = []
+    monkeypatch.setattr(realtime, "train_schedule_live", lambda t: lookups.append(t) or [])
+    board, _ = server._dropped_trains([{"train": late["train"], "depart": late["depart"], "final_stop": "X"}],
+                                      server.feeds.get().resolve_station("Jefferson"), {late["train"]}, None)
+    assert board == [] and lookups == []
+
+
+def test_bucket_and_clock():
+    assert server._bucket("3562") == "northbound" and server._bucket("5357") == "southbound"
+    ref = datetime(2026, 10, 31, 23, 50, tzinfo=server.TZ)
+    assert server._clock_near("12:05 am", ref) == datetime(2026, 11, 1, 0, 5, tzinfo=server.TZ)
+    assert server._clock_near("8:30PM", ref).hour == 20
+    assert server._clock_near("na", ref) is None
 
 
 # -- Metro ---------------------------------------------------------------------
