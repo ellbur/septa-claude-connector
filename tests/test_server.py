@@ -914,10 +914,59 @@ def test_bus_build_and_corners():
     (ride,) = feed.rides(feed.resolve_stop("Broad & Arch"), corner, start, end)
     d = bus.ride_to_dict(feed, ride, day)
     assert (d["depart"], d["arrive"], d["board_stop_id"], d["toward"], d["stops"]) == ("8:00 AM", "8:05 AM", "1", "Spruce", 0)
+    assert d["board_stop_where"].startswith("northwest corner (west side of Broad St, just north of Arch St")
     # No getting off where drop-off isn't allowed, and no departures from a trip's last stop.
     assert feed.rides(feed.resolve_stop("Broad & Arch"), feed.resolve_stop("Spruce"), start, end) == []
     assert [feed.trips[ti].trip_id for _, ti, _ in feed.departures(feed.resolve_stop("Spruce"), start, end)] == ["b"]
     assert [feed.trips[ti].trip_id for _, ti, _ in feed.departures(corner, start, end)] == ["a"]  # b ends there
+
+
+def _grid_bus_gtfs() -> bytes:
+    """Route 9 runs west along Pine St, stopping at 13th (near side, no mark), Broad (far
+    side, marked) and 15th (midblock); route 8 runs north on Broad past Pine."""
+    lon = {"13th": -75.1620, "Broad": -75.1640, "15th": -75.1660, "16th": -75.1680}
+    lat = {"Spruce": 39.9475, "Pine": 39.9455, "Lombard": 39.9445}
+    st = [("trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence")]
+    for k, sid in enumerate(["p12", "p13", "pbroad", "p15", "p16"]):
+        st.append(("w", f"08:0{k}:00", f"08:0{k}:00", sid, str(k + 1)))
+    for k, sid in enumerate(["blombard", "bpine", "bspruce"]):
+        st.append(("n", f"09:0{k}:00", f"09:0{k}:00", sid, str(k + 1)))
+    north = lat["Pine"] + 0.0001  # buses going west board on the north side
+    return _gtfs_zip(
+        routes=[("route_id", "route_short_name", "route_long_name", "route_type"), ("9", "9", "Pine", "3"),
+                ("8", "8", "Broad", "3")],
+        trips=[("route_id", "service_id", "trip_id", "trip_headsign", "direction_id"), ("9", "wk", "w", "West", "0"),
+               ("8", "wk", "n", "North", "0")],
+        stop_times=st,
+        stops=[("stop_id", "stop_name", "stop_lat", "stop_lon"),
+               ("p12", "Pine St & 12th St", str(north), "-75.1600"),
+               ("p13", "Pine St & 13th St", str(north), str(lon["13th"] + 0.0002)),  # east of 13th
+               ("pbroad", "Pine St & Broad St - FS", str(north), str(lon["Broad"] - 0.0002)),  # west of Broad
+               ("p15", "Pine St & 15th St - MB", str(north), str(lon["15th"] + 0.0010)),
+               ("p16", "Pine St & 16th St", str(north), str(lon["16th"] + 0.0002)),
+               ("blombard", "Broad St & Lombard St", str(lat["Lombard"] - 0.0002), str(lon["Broad"] + 0.0001)),
+               ("bpine", "Broad St & Pine St", str(lat["Pine"] - 0.0002), str(lon["Broad"] + 0.0001)),
+               ("bspruce", "Broad St & Spruce St", str(lat["Spruce"] - 0.0002), str(lon["Broad"] + 0.0001))],
+        calendar=[("service_id", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+                   "start_date", "end_date"), ("wk", "1", "1", "1", "1", "1", "0", "0", "20261101", "20261130")],
+    )
+
+
+def test_bus_stop_corners_from_geometry():
+    feed = bus.BusFeed(bus.build(_grid_bus_gtfs()))
+    where = {feed.stop_rows[i]["stop_id"]: feed.where(i) for i in range(len(feed.stop_rows))}
+    # Westbound on Pine: north side; an unmarked stop is before the cross street (east of it).
+    assert where["p13"] == ("northeast corner (north side of Pine St, just east of 13th St; near side), "
+                            "for westbound buses")
+    assert where["pbroad"].startswith("northwest corner (north side of Pine St, just west of Broad St; far side)")
+    assert where["p15"] == "north side of Pine St, midblock near 15th St, for westbound buses"
+    # Northbound on Broad: east side, south of Pine.
+    assert where["bpine"].startswith("southeast corner (east side of Broad St, just south of Pine St")
+    assert feed.locate(feed.stop_index["bpine"])["heading"] == "north"
+    # Shown wherever a stop is.
+    corner = feed.resolve_stop("Broad and Pine")
+    assert {s["stop_id"]: s.get("where") for s in server._corner_dict(feed, corner)["stops_here"]} == {
+        "pbroad": where["pbroad"], "bpine": where["bpine"]}
 
 
 def test_bus_build_needs_stop_times_grouped_by_trip():
@@ -940,6 +989,13 @@ def test_bus_stops_by_corner_and_number():
     assert len(set(e.value.candidates)) == len(e.value.candidates) > 1
     with pytest.raises(gtfs.StationNotFound, match="No bus stop matches"):
         feed.resolve_stop("Nowhere Blvd & Imaginary Ln")
+
+
+def test_bus_stop_corner_in_the_real_feed():
+    # Route 40 runs west on Lombard and stops before Broad, on the northeast corner.
+    feed = bus_feed()
+    where = feed.where(feed.stop_index["663"])
+    assert where and where.startswith("northeast corner (north side of Lombard St, just east of Broad St")
 
 
 def test_bus_routes():
