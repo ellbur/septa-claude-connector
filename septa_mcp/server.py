@@ -51,6 +51,10 @@ the trolleys T1-T5, G1, D1, D2; and the M1 Norristown High Speed Line) and buses
   or on another line's branch; that's normal, not a sign of the wrong train. depart and
   arrive are the times at board_at and get_off_at, the rider's own stations, not the
   train's ends.
+- SEPTA's live boards often drop a late train once its scheduled time passes, though it
+  hasn't come yet. next_trains and station_departures check for this and put such trains
+  back with on_live_board: false and their expected time. Don't assume a scheduled train
+  has left because a board doesn't list it; when unsure, check train_status.
 - Station names are matched loosely ("Jefferson", "30th Street", "Temple"). If a name is
   ambiguous the tool returns the candidates; ask the user or pick from context.
 - Shuttle buses that replace trains (see service_alerts) are part of the trip. If an alert
@@ -446,6 +450,8 @@ async def next_trains(from_station: str, to_station: str, count: int = 5) -> dic
 
     Uses SEPTA's real-time NextToArrive API (includes connecting trips when there is
     no direct train). Falls back to the published schedule if the live API is down.
+    Late trains SEPTA dropped from its live data but that haven't left yet are included,
+    marked on_live_board: false, with expected_depart and expected_arrive.
     """
     feed = feeds.get()
     try:
@@ -469,10 +475,28 @@ async def next_trains(from_station: str, to_station: str, count: int = 5) -> dic
         }
     trains = _with_final_stops(feed, trains, origin.name, dest.name)
     result = {**base, "source": "SEPTA real-time API", "trains": trains}
+    dropped, err = await anyio.to_thread.run_sync(_next_trains_dropped, feed, origin, dest, trains, count)
+    if dropped:
+        result["trains"] = trains = _merge_dropped(trains, dropped, "depart")
+        result["board_note"] = BOARD_NOTE.format(station=origin.name)
+    if err:
+        result["board_check_error"] = err
     if not trains:
         result.update(await anyio.to_thread.run_sync(_station_alerts, origin, dest))
         result.update(await _live_partial_service(feed, origin, dest, count, "service_alerts" in result))
     return result
+
+
+def _next_trains_dropped(feed, origin, dest, trains: list[dict], count: int):
+    ws, we = _dropped_window()
+    scheduled = [
+        {"train": r.train, "depart": r.depart_dt, "arrive": r.arrive_dt,
+         "final_stop": feed.destination(r.board_trip, feed.services_on(r.service_date))}
+        for r in feed.direct_rides(origin, dest, ws, we)
+    ]
+    on_board = {str(t.get("train")) for t in trains}
+    board_until = _clock_near(trains[-1].get("depart"), now()) if trains and len(trains) >= count else None
+    return _dropped_trains(scheduled, origin, on_board, board_until, dest)
 
 
 async def _live_partial_service(feed, origin, dest, count: int, have_alerts: bool) -> dict:
@@ -497,6 +521,169 @@ async def _live_partial_service(feed, origin, dest, count: int, have_alerts: boo
     return {"partial_service": out, "note": _partial_note(dest, end, have_alerts)}
 
 
+# SEPTA's live boards (Arrivals, NextToArrive) often drop a train once its scheduled time
+# has passed, even when it's running late and hasn't come yet, so riders and the model
+# conclude it left. Trains the timetable has leaving in this window that the board leaves
+# out are looked up one by one to see whether they really left.
+DROPPED_LOOKBACK_MIN = 30
+DROPPED_LOOKAHEAD_MIN = 20
+MAX_DROPPED_CHECKS = 4  # per-train lookups per answer (each is one live API request)
+# A train whose expected departure is longer ago than this has almost surely gone.
+DROPPED_GRACE_MIN = 3
+
+BOARD_NOTE = (
+    "SEPTA's live board leaves out trains once their scheduled time passes, even when they "
+    "are running late and haven't come yet. Trains marked on_live_board: false were checked "
+    "individually: they haven't left {station} yet, so don't tell riders they've gone."
+)
+
+
+def _clock_near(text, ref: datetime) -> datetime | None:
+    """'8:30 pm', '8:30PM' or '8:30 PM' -> that clock time on the day nearest ref."""
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*([ap])\.?m\.?\s*", str(text or ""), re.I)
+    if not m:
+        return None
+    h = int(m.group(1)) % 12 + (12 if m.group(3).lower() == "p" else 0)
+    dt = ref.replace(hour=h, minute=int(m.group(2)), second=0, microsecond=0)
+    if dt - ref > timedelta(hours=12):
+        dt -= timedelta(days=1)
+    elif ref - dt > timedelta(hours=12):
+        dt += timedelta(days=1)
+    return dt
+
+
+def _live_stop(stops: list[dict], station, scheduled: datetime) -> dict | None:
+    """station's row in a train's live stop list. SEPTA's per-train schedule uses its own
+    station names ("Gray 30th Street"), so fall back to matching the scheduled time."""
+    names = {normalize(station.name), normalize(realtime.api_station_name(station.name))}
+    for row in stops:
+        if normalize(str(row.get("station") or "")) in names:
+            return row
+    want = scheduled.replace(second=0, microsecond=0)
+    for row in stops:
+        if _clock_near(row.get("scheduled"), want) == want:
+            return row
+    return None
+
+
+def _dropped_window() -> tuple[datetime, datetime]:
+    current = now()
+    return current - timedelta(minutes=DROPPED_LOOKBACK_MIN), current + timedelta(minutes=DROPPED_LOOKAHEAD_MIN)
+
+
+def _dropped_trains(scheduled: list[dict], station, on_board: set[str], board_until: datetime | None,
+                    dest=None) -> tuple[list[dict], str | None]:
+    """Trains in `scheduled` ({train, depart, final_stop, arrive?}: the timetable's trains
+    leaving station around now) that aren't on the live board but are running and haven't
+    left it yet, per SEPTA's live position and stop-by-stop times. Trains scheduled after board_until (the last
+    train on a board that was cut off at its count) are skipped. Returns (trains, error)."""
+    current = now()
+    missing = [
+        s for s in scheduled
+        if str(s["train"]) not in on_board and (board_until is None or s["depart"] <= board_until)
+    ]
+    if not missing:
+        return [], None
+    try:
+        positions = {str(t.get("trainno")): t for t in realtime.train_view()}
+    except realtime.SeptaAPIError as e:
+        return [], f"Couldn't check scheduled trains missing from the live board: {e}"
+    found, checks = [], 0
+    for s in missing:
+        train, sched = str(s["train"]), s["depart"]
+        entry = {"train": train, "final_stop": s["final_stop"], "board_at": station.name,
+                 "scheduled_depart": fmt_time(sched)}
+        if dest is not None and s.get("arrive"):
+            entry["get_off_at"] = dest.name
+            entry["scheduled_arrive"] = fmt_time(s["arrive"])
+        pos = positions.get(train)
+        if pos is None:
+            # Not running (finished, not started, or cancelled): nothing says it's coming.
+            continue
+        try:
+            late = int(pos.get("late"))
+        except (TypeError, ValueError):
+            late = None
+        grace = current - timedelta(minutes=DROPPED_GRACE_MIN)
+        if late is not None and sched + timedelta(minutes=late) < grace:
+            continue  # gone, by its current lateness; no need to look it up
+        stops: list[dict] = []
+        if checks < MAX_DROPPED_CHECKS:
+            checks += 1
+            try:
+                stops = realtime.train_schedule_live(train)
+            except realtime.SeptaAPIError:
+                pass
+        row = _live_stop(stops, station, sched) if stops else None
+        if row and row.get("actual"):
+            continue  # it has left
+        est = _clock_near(row.get("estimated"), sched) if row else None
+        if est is None and late is not None:
+            est = sched + timedelta(minutes=late)
+        if est is None or est < grace:
+            continue
+        entry["on_live_board"] = False
+        entry["expected_depart"] = fmt_time(est)
+        if "scheduled_arrive" in entry:
+            arow = _live_stop(stops, dest, s["arrive"]) if stops else None
+            aest = _clock_near(arow.get("estimated"), s["arrive"]) if arow else None
+            if aest is None and late is not None:
+                aest = s["arrive"] + timedelta(minutes=late)
+            if aest:
+                entry["expected_arrive"] = fmt_time(aest)
+        entry["status"] = realtime.late_status(late)
+        entry["current_stop"] = pos.get("currentstop")
+        entry["next_stop"] = pos.get("nextstop")
+        track = (pos.get("TRACK_CHANGE") or pos.get("TRACK") or "").strip()
+        if track:
+            entry["track"] = track
+        summary = (f"Train {train} (final stop {s['final_stop']}) isn't on the live board but hasn't left "
+                   f"{station.name} yet: scheduled {entry['scheduled_depart']}, expected {entry['expected_depart']}")
+        if entry["status"]:
+            summary += f" ({entry['status']})"
+        if entry.get("expected_arrive"):
+            summary += f", arriving at {dest.name} about {entry['expected_arrive']}"
+        if entry["current_stop"]:
+            summary += f". Last at {entry['current_stop']}"
+        found.append({"summary": summary + ".", **entry})
+    return found, None
+
+
+def _merge_dropped(trains: list[dict], dropped: list[dict], time_key: str) -> list[dict]:
+    """dropped trains inserted into a board's trains by expected time."""
+    if not dropped:
+        return trains
+    ref = now()
+
+    def key(t):
+        dt = _clock_near(t.get("expected_depart") or t.get("scheduled_depart") or t.get(time_key), ref)
+        return dt or datetime.max.replace(tzinfo=TZ)
+
+    return sorted(trains + dropped, key=key)
+
+
+def _bucket(train) -> str:
+    """Which half of a station board a train is on: SEPTA numbers northbound trains even
+    and southbound trains odd."""
+    digits = re.sub(r"\D", "", str(train))
+    return "southbound" if digits and int(digits) % 2 else "northbound"
+
+
+def _board_dropped(feed, st, board: dict, count: int, direction: str | None):
+    ws, we = _dropped_window()
+    scheduled = feed.departures(st, ws, we)
+    if direction:
+        want = "northbound" if direction == "N" else "southbound"
+        scheduled = [s for s in scheduled if _bucket(s["train"]) == want]
+    on_board = {str(t.get("train")) for b in board.values() for t in b}
+    # A full half of the board was cut off at count: its later trains just didn't fit.
+    ref = now()
+    cutoff = {k: _clock_near(b[-1].get("scheduled"), ref) for k, b in board.items() if len(b) >= count}
+    scheduled = [s for s in scheduled
+                 if (c := cutoff.get(_bucket(s["train"]))) is None or s["depart"] <= c]
+    return _dropped_trains(scheduled, st, on_board, None)
+
+
 @mcp.tool(annotations=READ_ONLY)
 async def station_departures(
     station: str,
@@ -508,6 +695,10 @@ async def station_departures(
 
     direction: "N" or "S" as SEPTA labels trains at that station (roughly: N = headed
     toward the northern end of the system, S = toward the south/west); omit for both.
+
+    SEPTA's board drops late trains once their scheduled time passes, though they haven't
+    come yet. These are checked and included, marked on_live_board: false, with
+    scheduled_depart, expected_depart and where the train is now.
     """
     feed = feeds.get()
     try:
@@ -519,6 +710,15 @@ async def station_departures(
     except realtime.SeptaAPIError as e:
         return {"station": st.name, "error": str(e)}
     result = {"station": st.name, **board}
+    dropped, err = await anyio.to_thread.run_sync(_board_dropped, feed, st, board, count, direction)
+    for bucket in ("northbound", "southbound"):
+        mine = [t for t in dropped if _bucket(t["train"]) == bucket]
+        if mine:
+            result[bucket] = board[bucket] = _merge_dropped(board[bucket], mine, "departs")
+    if dropped:
+        result["board_note"] = BOARD_NOTE.format(station=st.name)
+    if err:
+        result["board_check_error"] = err
     if not any(board.values()):
         result.update(await anyio.to_thread.run_sync(_station_alerts, st))
     return result

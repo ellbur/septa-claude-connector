@@ -553,6 +553,23 @@ class RailFeed(ServiceCalendar):
                 out.append(r)
         return out
 
+    def departures(self, stop: Stop, window_start: datetime, window_end: datetime) -> list[dict]:
+        """Every train scheduled to leave stop in the window, in any direction:
+        {train, depart (datetime), final_stop}, by departure time."""
+        out, seen = [], set()
+        d = window_start.date() - timedelta(days=1)
+        while d <= window_end.date():
+            active = self.services_on(d)
+            for trip, i in self.stop_index.get(stop.stop_id, []):
+                if trip.service_id not in active or i == len(trip.times) - 1 or not trip.times[i].pickup:
+                    continue
+                dep = _to_dt(d, trip.times[i].dep)
+                if window_start <= dep <= window_end and (trip.train, dep) not in seen:
+                    seen.add((trip.train, dep))
+                    out.append({"train": trip.train, "depart": dep, "final_stop": self.destination(trip, active)})
+            d += timedelta(days=1)
+        return sorted(out, key=lambda x: x["depart"])
+
     def transfer_journeys(
         self,
         origin: Stop,

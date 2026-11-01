@@ -24,8 +24,8 @@ trolley and bus positions, and alerts for every mode).
 | Tool | Source | Use it for |
 |---|---|---|
 | `train_schedule(from_station, to_station, date, depart_after, depart_before)` | GTFS | Timetable questions for any day. Falls back to one-transfer itineraries when there's no direct train. |
-| `next_trains(from_station, to_station, count)` | Live (NextToArrive) | "Next train" right now, with delay status. Falls back to the timetable if the live API is down. |
-| `station_departures(station, count, direction)` | Live (Arrivals) | A station's departure board: final stops, delays, track numbers. |
+| `next_trains(from_station, to_station, count)` | Live (NextToArrive) | "Next train" right now, with delay status, including late trains the live board dropped. Falls back to the timetable if the live API is down. |
+| `station_departures(station, count, direction)` | Live (Arrivals) | A station's departure board: final stops, delays, track numbers, including late trains the board dropped. |
 | `train_status(train_number)` | Live (TrainView + RRSchedules) | Where a train is, how late, stop-by-stop estimates. |
 | `find_station(query)` | GTFS | Resolving vague or ambiguous station names. |
 | `metro_schedule(from_stop, to_stop, date, depart_after, depart_before, line)` | GTFS | Subway and trolley timetables for any day, with one-transfer itineraries (including short walks between stations) when there's no direct trip. |
@@ -85,6 +85,14 @@ back together, so you see every train.
 Trains are reported by number and `final_stop`, the way platform boards list them,
 rather than by line. The line name a train has at your boarding station can belong to the
 other half of its run, e.g. a Suburban → Claymont train shows up as "Chestnut Hill East".
+
+**Live boards drop late trains.** SEPTA's Arrivals and NextToArrive often stop listing a
+train once its scheduled time passes, even when it's running late and hasn't reached the
+station yet, so the board makes it look like the train already left. `next_trains` and
+`station_departures` check the timetable for trains due from 30 minutes ago to 20 minutes
+from now that the board leaves out. They look up each one's live position (TrainView) and
+stop-by-stop times (RRSchedules), and put back any train that is running and has no actual
+departure time at the station yet, marked `on_live_board: false` with its expected time.
 
 **Station names differ between feeds.** The real-time API predates the current GTFS and
 uses older names for about 30 stations ("Temple U", "30th Street Station", "Ft Washington",
