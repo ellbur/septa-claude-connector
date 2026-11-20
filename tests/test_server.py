@@ -152,6 +152,8 @@ def test_next_trains_live():
     r = call("next_trains", {"from_station": "Jefferson", "to_station": "Swarthmore", "count": 2})
     assert r["source"] == "SEPTA real-time API"
     # 5301 left hours ago; the real API still lists such trains and they must be dropped.
+    # Trains the timetable had leaving in the last few minutes (real clock) come first.
+    r["trains"] = [t for t in r["trains"] if not t.get("likely_departed")]
     assert [t["train"] for t in r["trains"]] == ["5317", "5321"]
     assert r["trains"][0]["status"] == "3 min" and r["trains"][0]["direct"] is True
     assert r["trains"][0]["board_at"] == "Jefferson Station" and r["trains"][0]["get_off_at"] == "Swarthmore"
@@ -612,6 +614,40 @@ def test_next_trains_finds_late_train_dropped_from_board(monkeypatch):
     assert t["expected_arrive"] == gtfs.fmt_time(late["arrive"] + timedelta(minutes=7))
     assert gone["train"] not in [x["train"] for x in r["trains"]]
     assert "board_note" in r
+
+
+def test_next_trains_lists_trains_that_just_left(monkeypatch):
+    """A train that left a few minutes ago comes first, marked likely_departed, with its
+    live lateness; past trains are capped at count and don't use up the upcoming ones."""
+    feed = server.feeds.get()
+    jeff, temple = feed.resolve_station("Jefferson"), feed.resolve_station("Temple")
+    start = datetime.combine(next_weekday(1), dtime(9, 0), server.TZ)
+    rides = feed.direct_rides(jeff, temple, start, start + timedelta(hours=3))
+    # Two trains a few minutes apart, then the time just after the second one left.
+    i = next(i for i in range(1, len(rides))
+             if timedelta(0) < rides[i].depart_dt - rides[i - 1].depart_dt <= timedelta(minutes=6))
+    earlier, just_left = rides[i - 1], rides[i]
+    current = just_left.depart_dt + timedelta(minutes=3)
+    monkeypatch.setattr(server, "now", lambda: current)
+    upcoming = [{"train": "9999", "line": "X", "depart": "11:59PM", "arrive": "11:59PM", "status": "On Time"}]
+    monkeypatch.setattr(realtime, "next_to_arrive", lambda *a: upcoming)
+    monkeypatch.setattr(realtime, "train_view", lambda: [
+        {"trainno": just_left.train, "late": 2, "currentstop": "Temple U"}])
+    monkeypatch.setattr(realtime, "train_schedule_live", lambda t: [
+        {"station": "Jefferson Station", "scheduled": "x", "estimated": "x", "actual": "9:00 am"}])
+
+    r = call("next_trains", {"from_station": "Jefferson", "to_station": "Temple", "count": 1})
+    assert [t["train"] for t in r["trains"]] == [just_left.train, "9999"]
+    t = r["trains"][0]
+    assert t["likely_departed"] is True and t["status"] == "2 min late"
+    assert t["expected_arrive"] == gtfs.fmt_time(just_left.arrive_dt + timedelta(minutes=2))
+    assert "has likely departed" in t["summary"]
+
+    r = call("next_trains", {"from_station": "Jefferson", "to_station": "Temple", "count": 5})
+    past = [t["train"] for t in r["trains"] if t.get("likely_departed")]
+    assert past[-2:] == [earlier.train, just_left.train] and r["trains"][-1]["train"] == "9999"
+    assert all(current - x.depart_dt <= timedelta(minutes=server.RECENT_LOOKBACK_MIN)
+               for x in rides if x.train in past)
 
 
 def test_board_check_skips_trains_on_the_board(monkeypatch):
