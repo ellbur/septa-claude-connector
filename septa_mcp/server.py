@@ -469,13 +469,17 @@ async def next_trains(from_station: str, to_station: str, count: int = 5) -> dic
     except realtime.SeptaAPIError as e:
         # The alerts come from the same API that just failed, so don't try for them.
         fallback = _train_schedule(origin.stop_id, dest.stop_id, "today", max_results=count, with_alerts=False)
-        return {
+        result = {
             **base,
             "source": "published schedule (live data unavailable)",
             "live_error": str(e),
             "trains": fallback.get("trains") or fallback.get("itineraries") or [],
             **{k: fallback[k] for k in ("partial_service", "note") if k in fallback},
         }
+        recent = await anyio.to_thread.run_sync(_recent_departures, feed, origin, dest,
+                                               {str(t.get("train")) for t in result["trains"]}, count, False)
+        result["trains"] = recent + result["trains"]
+        return result
     trains = _with_final_stops(feed, trains, origin.name, dest.name)
     result = {**base, "source": "SEPTA real-time API", "trains": trains}
     dropped, err = await anyio.to_thread.run_sync(_next_trains_dropped, feed, origin, dest, trains, count)
@@ -487,7 +491,55 @@ async def next_trains(from_station: str, to_station: str, count: int = 5) -> dic
     if not trains:
         result.update(await anyio.to_thread.run_sync(_station_alerts, origin, dest))
         result.update(await _live_partial_service(feed, origin, dest, count, "service_alerts" in result))
+    shown = {str(t.get("train")) for t in trains}
+    recent = await anyio.to_thread.run_sync(_recent_departures, feed, origin, dest, shown, count, True)
+    result["trains"] = recent + result["trains"]
     return result
+
+
+# next_trains also lists trains scheduled to leave in the last few minutes (up to count of
+# them, on top of the upcoming ones), so a rider who boarded just before the question, or
+# a train that left its first stop just before the check, isn't missed.
+RECENT_LOOKBACK_MIN = 10
+
+
+def _recent_departures(feed, origin, dest, shown: set[str], count: int, live: bool) -> list[dict]:
+    """Trains the timetable has leaving origin for dest in the last RECENT_LOOKBACK_MIN
+    minutes that aren't already listed, marked likely_departed, with live lateness when
+    SEPTA has it."""
+    current = now()
+    rides = [r for r in feed.direct_rides(origin, dest, current - timedelta(minutes=RECENT_LOOKBACK_MIN), current)
+             if str(r.train) not in shown and r.depart_dt < current]
+    rides = rides[-count:] if count > 0 else []
+    if not rides:
+        return []
+    positions: dict = {}
+    if live:
+        try:
+            positions = {str(t.get("trainno")): t for t in realtime.train_view()}
+        except realtime.SeptaAPIError:
+            pass
+    out = []
+    for r in rides:
+        d = ride_to_dict(feed, r, current.date())
+        d.pop("summary", None)
+        d["likely_departed"] = True
+        pos = positions.get(str(r.train))
+        try:
+            late = int(pos.get("late")) if pos else None
+        except (TypeError, ValueError):
+            late = None
+        s = (f"Train {d['train']} (final stop {d['final_stop']}) was scheduled to leave {d['board_at']} at "
+             f"{d['depart']} and has likely departed; scheduled to arrive at {d['get_off_at']} at {d['arrive']}")
+        if late is not None:
+            d["status"] = realtime.late_status(late)
+            d["expected_arrive"] = fmt_time(r.arrive_dt + timedelta(minutes=late))
+            s += f", expected about {d['expected_arrive']} ({d['status']})"
+            if pos.get("currentstop"):
+                d["current_stop"] = pos.get("currentstop")
+                s += f". Last at {d['current_stop']}"
+        out.append({"summary": s + ".", **d})
+    return out
 
 
 def _next_trains_dropped(feed, origin, dest, trains: list[dict], count: int):
