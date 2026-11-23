@@ -226,6 +226,14 @@ class BadRequest(dict):
         super().__init__(error=msg)
 
 
+class ServerError:
+    """A response with this HTTP status and body (the alerts API has answered 501 along
+    with the full alerts list)."""
+
+    def __init__(self, status: int, body=None):
+        self.status, self.body = status, body
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
         u = urlparse(self.path)
@@ -237,6 +245,13 @@ class Handler(BaseHTTPRequestHandler):
             bad = [n for n in q.get("req1", []) + q.get("req2", []) if n in NTA_INVALID]
             if bad:
                 data = BadRequest(f"An error has occurred. '{bad[0]}' is not a valid station,")
+        if isinstance(data, ServerError):
+            self.send_response(data.status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            if data.body is not None:
+                self.wfile.write(json.dumps(data.body).encode())
+            return
         binary = isinstance(data, bytes)
         body = data if binary else json.dumps(data).encode()
         self.send_response(400 if isinstance(data, BadRequest) else 200 if fn else 404)

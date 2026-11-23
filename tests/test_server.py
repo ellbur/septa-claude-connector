@@ -37,10 +37,20 @@ geocode.GEOCODER_URL = f"http://127.0.0.1:{_mock.server_port}/nominatim/search"
 geocode.MIN_INTERVAL = 0
 
 
+def _no_fetches_running(seconds: float = 15):
+    import time
+    end = time.monotonic() + seconds
+    while any(lock.locked() for lock in list(realtime._url_locks.values())) and time.monotonic() < end:
+        time.sleep(0.01)
+
+
 @pytest.fixture(autouse=True)
 def _fresh_api_cache():
+    _no_fetches_running()  # so an earlier test's background fetch can't fill this one's cache
     realtime.clear_cache()
     geocode.clear_cache()
+    yield
+    _no_fetches_running()
 
 
 def call(tool: str, args: dict) -> dict:
@@ -1481,3 +1491,171 @@ def test_point_in_outline():
     multi = {"type": "MultiPolygon", "coordinates": [square["coordinates"], [[[10, 10], [11, 10], [11, 11], [10, 10]]]]}
     assert geocode.contains(multi, 10.3, 10.6) and geocode.contains(multi, 3, 3)  # (lat, lon)
     assert not geocode.contains(multi, 10.6, 10.3)
+
+
+ALERTS_PATH = "/api/Alerts/get_alert_data.php"
+
+
+def _alerts_requests() -> int:
+    return sum(1 for p, _ in mock_septa_api.REQUESTS if p == ALERTS_PATH)
+
+
+def test_alerts_sent_with_server_error_status(monkeypatch):
+    """SEPTA's alerts API has been answering 501 with the full, valid list."""
+    monkeypatch.setitem(mock_septa_api.ROUTES, ALERTS_PATH,
+                        lambda q: mock_septa_api.ServerError(501, mock_septa_api.ALERTS))
+    r = call("service_alerts", {"line": "Media/Wawa Line"})
+    assert r["count"] == 1 and "alerts_note" not in r, r
+
+
+def test_alerts_without_json_api(monkeypatch):
+    """When the JSON alerts API is down, the GTFS-realtime feeds' alerts are still given."""
+    monkeypatch.setitem(mock_septa_api.ROUTES, ALERTS_PATH, lambda q: mock_septa_api.ServerError(502))
+    r = call("service_alerts", {"line": "MFL"})
+    assert [a["route_id"] for a in r["alerts"]] == ["L1"]
+    assert "HTTP 502" in r["alerts_note"] and "real-time feeds" in r["alerts_note"]
+    # Metro answers still carry the feeds' alerts.
+    assert realtime.alerts().note
+
+
+def test_alerts_with_neither_source(monkeypatch):
+    monkeypatch.setitem(mock_septa_api.ROUTES, ALERTS_PATH, lambda q: mock_septa_api.ServerError(502))
+    monkeypatch.setattr(realtime, "GTFSRT_BASE", realtime.GTFSRT_BASE + "/missing")
+    assert "HTTP 502" in call("service_alerts", {})["error"]
+
+
+def test_alerts_note_when_feeds_missing(monkeypatch):
+    monkeypatch.setattr(realtime, "GTFSRT_BASE", realtime.GTFSRT_BASE + "/missing")
+    assert "real-time alert feeds couldn't be read" in call("service_alerts", {"line": "MFL"})["alerts_note"]
+
+
+def test_json_alerts_cached_long_feeds_briefly(monkeypatch):
+    monkeypatch.setattr(realtime, "GTFSRT_ALERTS_CACHE_SECONDS", 0)
+    mock_septa_api.REQUESTS.clear()
+    realtime.alerts()
+    realtime.alerts()
+    paths = [p for p, _ in mock_septa_api.REQUESTS]
+    assert paths.count(ALERTS_PATH) == 1
+    assert paths.count("/gtfsrt" + realtime.GTFSRT_ALERT_PATHS[0]) == 2
+
+
+def _wait_for(cond, seconds: float = 5):
+    import time
+    end = time.monotonic() + seconds
+    while not cond():
+        assert time.monotonic() < end, "timed out"
+        time.sleep(0.01)
+
+
+def test_stale_alerts_served_while_refreshing(monkeypatch):
+    """Past ALERTS_CACHE_SECONDS, the old alerts are answered at once and refreshed behind."""
+    import threading
+
+    monkeypatch.setattr(realtime, "ALERTS_CACHE_SECONDS", 0)
+    mock_septa_api.REQUESTS.clear()
+    assert any(a["route_id"] == "rr_route_med" for a in realtime.alerts())
+    assert _alerts_requests() == 1
+
+    release = threading.Event()
+
+    def slow(q):
+        release.wait(5)
+        return mock_septa_api.ServerError(502)
+
+    monkeypatch.setitem(mock_septa_api.ROUTES, ALERTS_PATH, slow)
+    # The API is now slow and then failing, but answers come at once from the old copy.
+    for _ in range(3):
+        r = realtime.alerts()
+        assert any(a["route_id"] == "rr_route_med" for a in r) and r.note is None
+    _wait_for(lambda: _alerts_requests() == 2)  # one background refresh, not three
+    release.set()
+    # The failed refresh leaves the old copy, and the next call tries again.
+    _wait_for(lambda: not any(lock.locked() for lock in realtime._url_locks.values()))
+    monkeypatch.setitem(mock_septa_api.ROUTES, ALERTS_PATH, lambda q: [])
+    assert any(a["route_id"] == "rr_route_med" for a in realtime.alerts())
+    _wait_for(lambda: _alerts_requests() == 3)
+    _wait_for(lambda: not any(a["route_id"] == "rr_route_med" for a in realtime.alerts()))
+
+
+def test_alerts_too_stale_are_dropped(monkeypatch):
+    monkeypatch.setattr(realtime, "ALERTS_CACHE_SECONDS", 0)
+    monkeypatch.setattr(realtime, "ALERTS_MAX_STALE_SECONDS", 0)
+    realtime.alerts()
+    monkeypatch.setitem(mock_septa_api.ROUTES, ALERTS_PATH, lambda q: mock_septa_api.ServerError(502))
+    r = realtime.alerts()
+    assert not any(a["route_id"] == "rr_route_med" for a in r) and "HTTP 502" in r.note
+
+
+def _slow_alerts(monkeypatch, then=None):
+    """Makes the JSON alerts API hang until the returned event is set, then answer `then`
+    (default: the usual alerts)."""
+    import threading
+
+    release = threading.Event()
+
+    def slow(q):
+        release.wait(10)
+        return mock_septa_api.ALERTS if then is None else then
+
+    monkeypatch.setitem(mock_septa_api.ROUTES, ALERTS_PATH, slow)
+    monkeypatch.setattr(realtime, "ALERTS_WAIT_SECONDS", 0.2)
+    return release
+
+
+def _idle():
+    _wait_for(lambda: not any(lock.locked() for lock in realtime._url_locks.values()))
+
+
+def test_cold_alerts_answer_at_once_then_fill_in(monkeypatch):
+    """With nothing cached and a slow alerts API, the real-time feeds' alerts come back
+    at once with a note to ask again; by then the full list is cached."""
+    import time
+
+    release = _slow_alerts(monkeypatch)
+    mock_septa_api.REQUESTS.clear()
+    t = time.monotonic()
+    r = call("service_alerts", {"line": "MFL"})
+    assert time.monotonic() - t < 3
+    assert [a["route_id"] for a in r["alerts"]] == ["L1"]
+    assert "still loading" in r["alerts_note"] and "again in about 20 seconds" in r["alerts_note"]
+    release.set()
+    _idle()
+    r = call("service_alerts", {"line": "MFL"})
+    assert [a["route_id"] for a in r["alerts"]] == ["rr_route_mfo", "L1"] and "alerts_note" not in r
+    assert _alerts_requests() == 1  # the second call used the first one's fetch
+
+
+def test_cold_alerts_failure_reported_on_next_call(monkeypatch):
+    release = _slow_alerts(monkeypatch, then=mock_septa_api.ServerError(502))
+    assert "still loading" in realtime.alerts().note
+    release.set()
+    _idle()
+    monkeypatch.setitem(mock_septa_api.ROUTES, ALERTS_PATH, lambda q: mock_septa_api.ServerError(502))
+    assert "HTTP 502" in realtime.alerts().note
+
+
+def test_cold_alerts_with_no_feeds(monkeypatch):
+    release = _slow_alerts(monkeypatch)
+    monkeypatch.setattr(realtime, "GTFSRT_BASE", realtime.GTFSRT_BASE + "/missing")
+    r = call("service_alerts", {})
+    assert "still loading" in r["error"] and "Try again in about 20 seconds" in r["error"]
+    release.set()
+    _idle()
+
+
+def test_metro_answers_carry_loading_note(monkeypatch):
+    release = _slow_alerts(monkeypatch)
+    r = call("metro_schedule", {"from_stop": "13th St", "to_stop": "46th St", "line": "L1",
+                                "date": next_weekday(1).isoformat(), "depart_after": "10:00"})
+    assert "still loading" in r["alerts_note"]
+    release.set()
+    _idle()
+
+
+def test_alerts_warmed_at_startup(monkeypatch):
+    realtime.warm_alerts()
+    _idle()
+    assert _alerts_requests() >= 1
+    before = _alerts_requests()
+    assert realtime.alerts().note is None
+    assert _alerts_requests() == before

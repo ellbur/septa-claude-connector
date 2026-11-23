@@ -216,7 +216,7 @@ def _station_alerts(*stations) -> dict:
     except realtime.SeptaAPIError as e:
         return {"alerts_error": str(e)}
     relevant = _alerts_for_lines(alerts, [feed.route_name(r) for r in routes])
-    return {"service_alerts": relevant} if relevant else {}
+    return {"service_alerts": relevant, **_partial(alerts)} if relevant else _partial(alerts)
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +825,7 @@ async def service_alerts(
         alerts = await anyio.to_thread.run_sync(realtime.alerts)
     except realtime.SeptaAPIError as e:
         return {"error": str(e)}
+    partial = _partial(alerts)
     for a in alerts:
         if a["mode"] == "metro":
             a["lines"] = _alert_lines(a)
@@ -832,19 +833,19 @@ async def service_alerts(
         alerts = [a for a in alerts if a["mode"] in (mode, "systemwide")]
     if line:
         matched = _match_alerts(alerts, line)
-        result: dict = {"line": line, "alerts": matched, "count": len(matched)}
+        result: dict = {"line": line, "alerts": matched, "count": len(matched), **partial}
         if not any(a["mode"] != "systemwide" for a in matched):
             result["note"] = f"No current alerts for '{line}'."
             result.update(_lines_with_alerts(alerts))
         return result
     if mode is None:
         shown = [a for a in alerts if a["mode"] != "bus"]
-        result = {"alerts": shown, "count": len(shown)}
+        result = {"alerts": shown, "count": len(shown), **partial}
         if len(shown) < len(alerts):
             result["bus_routes_with_alerts"] = _lines_with_alerts(alerts)["bus_routes_with_alerts"]
             result["note"] = "Bus alerts aren't listed here; pass line='<route>' or mode='bus' for them."
         return result
-    return {"alerts": alerts, "count": len(alerts)}
+    return {"alerts": alerts, "count": len(alerts), **partial}
 
 
 def _lines_with_alerts(alerts: list[dict]) -> dict:
@@ -902,7 +903,12 @@ def _metro_alerts(*stations) -> dict:
         for a in alerts
         if a["mode"] == "systemwide" or set(_alert_lines(a)) & lines
     ]
-    return {"service_alerts": relevant} if relevant else {}
+    return {"service_alerts": relevant, **_partial(alerts)} if relevant else _partial(alerts)
+
+
+def _partial(alerts) -> dict:
+    """alerts_note, when some of SEPTA's alerts couldn't be read (or are still loading)."""
+    return {"alerts_note": alerts.note} if getattr(alerts, "note", None) else {}
 
 
 def _alert_lines(a: dict) -> list[str]:
@@ -939,7 +945,9 @@ def _metro_trip_alerts(lines: set[str], names: list[str]) -> dict:
             or any(_alert_mentions(a, n) for n in names)
         )
     ]
-    return {"service_alerts": relevant, "alerts_note": ALERTS_NOTE} if relevant else {}
+    if not relevant:
+        return _partial(alerts)
+    return {"service_alerts": relevant, "alerts_note": " ".join(filter(None, [ALERTS_NOTE, alerts.note]))}
 
 
 def _metro_alerts_about(names: list[str]) -> dict:
@@ -954,7 +962,7 @@ def _metro_alerts_about(names: list[str]) -> dict:
         for a in alerts
         if a["mode"] == "metro" and any(_alert_mentions(a, n) for n in names)
     ]
-    return {"service_alerts": about} if about else {}
+    return {"service_alerts": about, **_partial(alerts)} if about else _partial(alerts)
 
 
 def _not_named(feed, query: str, st) -> bool:
@@ -1427,7 +1435,7 @@ def _bus_alerts(feed, routes: set[str]) -> dict:
         a for a in alerts
         if a["mode"] == "systemwide" or (a["mode"] == "bus" and str(a.get("route_name", "")).lower() in names)
     ]
-    return {"service_alerts": relevant} if relevant else {}
+    return {"service_alerts": relevant, **_partial(alerts)} if relevant else _partial(alerts)
 
 
 def _corner_dict(feed, corner) -> dict:
@@ -1955,6 +1963,8 @@ def main() -> None:
                 log.warning("%s", e)
         return
 
+    # SEPTA's alerts API takes ~15 s to answer, so start on it while the timetables load.
+    realtime.warm_alerts()
     # Load (and if needed download) the timetable up front so the first question is fast.
     log.info("Loaded SEPTA rail schedule: %s", feeds.get().summary())
     for kind in ("metro", "bus"):
