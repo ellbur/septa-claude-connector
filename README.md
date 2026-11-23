@@ -144,6 +144,15 @@ and drops GTFS-realtime alerts whose text the JSON API already has. GTFS-realtim
 that name only single trips (cancelled bus trips) are left out. They're read with a small
 built-in protobuf decoder (`septa_mcp/gtfsrt.py`), so there's no protobuf dependency.
 
+The two are cached differently. The JSON API's alerts are the advisories and detours on
+SEPTA's website, which rarely change within a day, and it can take 15+ seconds to answer
+(lately with HTTP 501 along with a valid list, which is accepted), so it's cached for 20
+minutes; after that the cached copy is still answered at once while a background request
+refreshes it, and kept for up to 6 hours if refreshing fails. The GTFS-realtime feeds
+answer in under a second and carry the time-sensitive alerts, so they're cached for only a
+minute. If either source can't be read, the other's alerts are returned with an
+`alerts_note` saying what may be missing.
+
 ## Run it
 
 Requires Python 3.11+.
@@ -259,7 +268,10 @@ For local use only, point a desktop MCP client at the stdio command instead:
 | `SEPTA_GEOCODER_EMAIL` | — | Contact address sent to the geocoder, which Nominatim asks heavier users for |
 | `SEPTA_API_TIMEOUT` | `10` | Seconds per real-time request |
 | `SEPTA_API_CACHE_SECONDS` | `10` | How long identical real-time requests share a response |
-| `SEPTA_ALERTS_CACHE_SECONDS` | `60` | How long alerts are reused (the Metro tools fetch them with every answer) |
+| `SEPTA_ALERTS_CACHE_SECONDS` | `1200` | How long the JSON API's alerts are used before being refreshed in the background |
+| `SEPTA_ALERTS_MAX_STALE_SECONDS` | `21600` | How long past that they're still used while refreshing fails |
+| `SEPTA_ALERTS_TIMEOUT` | `30` | Seconds to wait for the JSON alerts API, which is slow |
+| `SEPTA_GTFSRT_ALERTS_CACHE_SECONDS` | `60` | How long the GTFS-realtime alert feeds are reused |
 | `SEPTA_API_MAX_PER_MINUTE` | `60` | Most real-time requests sent to SEPTA in any 60 seconds (per process) |
 | `MCP_TRANSPORT`, `HOST`, `PORT` | `stdio`, `0.0.0.0`, `8000` | Server transport settings |
 

@@ -35,8 +35,17 @@ TIMEOUT = float(os.environ.get("SEPTA_API_TIMEOUT", "10"))
 # single instance so the limit holds for the whole app.
 CACHE_SECONDS = float(os.environ.get("SEPTA_API_CACHE_SECONDS", "10"))
 MAX_PER_MINUTE = int(os.environ.get("SEPTA_API_MAX_PER_MINUTE", "60"))
-# Alerts change slowly and the Metro tools fetch them with every answer, so keep them longer.
-ALERTS_CACHE_SECONDS = float(os.environ.get("SEPTA_ALERTS_CACHE_SECONDS", "60"))
+# Alerts come from two sources, cached differently. SEPTA's JSON alerts API carries the
+# advisories and detours posted on its website, which rarely change within a day, and it
+# can take 15+ s to answer, so it's cached for ALERTS_CACHE_SECONDS; after that the old
+# copy is still served at once while a background request refreshes it, and if refreshing
+# keeps failing, the old copy is used for up to ALERTS_MAX_STALE_SECONDS more. The
+# GTFS-realtime feeds answer in under a second and carry the time-sensitive alerts (closed
+# stations, shuttle buses, platform changes), so they're kept only GTFSRT_ALERTS_CACHE_SECONDS.
+ALERTS_CACHE_SECONDS = float(os.environ.get("SEPTA_ALERTS_CACHE_SECONDS", "1200"))
+ALERTS_MAX_STALE_SECONDS = float(os.environ.get("SEPTA_ALERTS_MAX_STALE_SECONDS", str(6 * 3600)))
+ALERTS_TIMEOUT = float(os.environ.get("SEPTA_ALERTS_TIMEOUT", "30"))
+GTFSRT_ALERTS_CACHE_SECONDS = float(os.environ.get("SEPTA_GTFSRT_ALERTS_CACHE_SECONDS", "60"))
 TZ = ZoneInfo("America/New_York")
 
 # GTFS stop_name -> name the real-time API expects (only where they differ).
@@ -90,7 +99,7 @@ class SeptaAPIError(RuntimeError):
     pass
 
 
-_cache: dict[str, tuple[float, Any]] = {}  # url -> (expires, data)
+_cache: dict[str, tuple[float, float, Any]] = {}  # url -> (fresh until, usable until, data)
 _url_locks: dict[str, threading.Lock] = {}
 _sent: list[float] = []  # times of requests sent in the last minute
 _lock = threading.Lock()
@@ -113,54 +122,86 @@ def _take_slot(now: float) -> float:
         return 0
 
 
-def _get(path: str, params: dict[str, Any] | None = None, ttl: float | None = None) -> Any:
+def _get(path: str, params: dict[str, Any] | None = None, ttl: float | None = None,
+         stale: float = 0, timeout: float | None = None) -> Any:
     q = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
     url = f"{BASE_URL}{path}"
     if q:
         url += "?" + urllib.parse.urlencode(q)
-    return _cached(url, _fetch, ttl)
+    return _cached(url, lambda u: _fetch(u, timeout), ttl, stale)
 
 
-def _cached(url: str, fetch, ttl: float | None = None) -> Any:
-    """fetch(url), or its answer from the last ttl (default CACHE_SECONDS) seconds."""
+def _cached(url: str, fetch, ttl: float | None = None, stale: float = 0) -> Any:
+    """fetch(url), or its answer from the last ttl (default CACHE_SECONDS) seconds.
+
+    With stale > 0, an answer up to `stale` seconds past its ttl is still returned at once
+    while a background thread fetches a new one; if that fails, the old answer stays.
+    """
+    ttl = CACHE_SECONDS if ttl is None else ttl
     with _lock:
         url_lock = _url_locks.setdefault(url, threading.Lock())
+        hit = _cache.get(url)
+    now = time.monotonic()
+    if hit and hit[0] > now:
+        return hit[2]
+    if hit and hit[1] > now:
+        if url_lock.acquire(blocking=False):  # else a refresh is already under way
+            threading.Thread(target=_refresh, args=(url, fetch, ttl, stale, url_lock), daemon=True).start()
+        return hit[2]
     # One request per URL at a time, so concurrent callers wait for the first one's answer.
     with url_lock:
-        now = time.monotonic()
         with _lock:
             hit = _cache.get(url)
-        if hit and hit[0] > now:
-            return hit[1]
-        wait = _take_slot(now)
-        if wait:
-            raise SeptaAPIError(
-                f"Live SEPTA data is paused: this server's limit of {MAX_PER_MINUTE} requests per minute "
-                f"to SEPTA, shared by all its users, was reached. Try again in about {max(1, round(wait))} seconds."
-            )
-        data = fetch(url)
-        with _lock:
-            if len(_cache) > 500:
-                for k in [k for k, (exp, _) in _cache.items() if exp <= now]:
-                    del _cache[k]
-                    if not _url_locks[k].locked():
-                        del _url_locks[k]
-            _cache[url] = (now + (CACHE_SECONDS if ttl is None else ttl), data)
-        return data
+        if hit and hit[0] > time.monotonic():
+            return hit[2]
+        return _fetch_and_store(url, fetch, ttl, stale)
 
 
-def _fetch(url: str) -> Any:
+def _refresh(url: str, fetch, ttl: float, stale: float, url_lock: threading.Lock) -> None:
+    try:
+        _fetch_and_store(url, fetch, ttl, stale)
+    except Exception:  # noqa: BLE001 - the old answer stays until it's too old
+        pass
+    finally:
+        url_lock.release()
+
+
+def _fetch_and_store(url: str, fetch, ttl: float, stale: float) -> Any:
+    wait = _take_slot(time.monotonic())
+    if wait:
+        raise SeptaAPIError(
+            f"Live SEPTA data is paused: this server's limit of {MAX_PER_MINUTE} requests per minute "
+            f"to SEPTA, shared by all its users, was reached. Try again in about {max(1, round(wait))} seconds."
+        )
+    data = fetch(url)
+    now = time.monotonic()
+    with _lock:
+        if len(_cache) > 500:
+            for k in [k for k, (_, usable, _) in _cache.items() if usable <= now]:
+                del _cache[k]
+                if not _url_locks[k].locked():
+                    del _url_locks[k]
+        _cache[url] = (now + ttl, now + ttl + stale, data)
+    return data
+
+
+def _fetch(url: str, timeout: float | None = None) -> Any:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or TIMEOUT) as resp:
             body = resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
-        # SEPTA reports bad stations / unknown trains as 400 {"error": "..."}.
         try:
-            msg = json.loads(e.read().decode("utf-8", "replace"))["error"]
+            data = json.loads(e.read().decode("utf-8", "replace"))
         except Exception:  # noqa: BLE001
             raise SeptaAPIError(f"SEPTA real-time API returned HTTP {e.code}") from e
-        raise SeptaAPIError(f"SEPTA API error: {html.unescape(str(msg))}") from e
+        # SEPTA reports bad stations / unknown trains as 400 {"error": "..."}.
+        if isinstance(data, dict) and "error" in data:
+            raise SeptaAPIError(f"SEPTA API error: {html.unescape(str(data['error']))}") from e
+        # The alerts API has taken to answering 501 along with the full, valid alerts list.
+        if e.code >= 500 and isinstance(data, list) and data:
+            return data
+        raise SeptaAPIError(f"SEPTA real-time API returned HTTP {e.code}") from e
     except Exception as e:  # noqa: BLE001
         raise SeptaAPIError(f"SEPTA real-time API unreachable ({e})") from e
     body = body.strip()
@@ -362,16 +403,46 @@ def _alert_mode(route_id: str) -> str | None:
     return None  # the app, paratransit (CCT)
 
 
-def alerts() -> list[dict]:
+class AlertList(list):
+    """alerts()'s result: a list of alerts, plus a note when one source couldn't be read."""
+
+    note: str | None = None
+
+
+def alerts() -> AlertList:
     """Current alerts for every mode, each tagged with its mode: regional_rail, metro,
     bus or systemwide. Rows with no message are left out.
 
     The JSON alerts API misses many alerts that SEPTA posts only to its GTFS-realtime
     feeds (station closures, Metro shuttle buses, platform changes, elevator outages), so
-    those are added from there. If the GTFS-realtime feeds can't be read, the JSON alerts
-    are still returned.
+    those are added from there. If either source can't be read, the other's alerts are
+    still returned, with a note saying what may be missing; if neither can, SeptaAPIError.
     """
-    data = _get("/Alerts/get_alert_data.php", ttl=ALERTS_CACHE_SECONDS)
+    try:
+        data = _get("/Alerts/get_alert_data.php", ttl=ALERTS_CACHE_SECONDS,
+                    stale=ALERTS_MAX_STALE_SECONDS, timeout=ALERTS_TIMEOUT)
+        json_error = None
+    except SeptaAPIError as e:
+        data, json_error = [], e
+    out = _json_alerts(data)
+    extra, feeds_read = _gtfsrt_alerts(out)
+    if json_error and not feeds_read:
+        raise json_error
+    result = AlertList(out + extra)
+    if json_error:
+        result.note = (
+            f"SEPTA's main alerts list couldn't be read ({json_error}), so only the alerts in its "
+            "real-time feeds (closed stations, shuttle buses, platform changes, some detours) are "
+            "shown; other advisories and detours may be missing."
+        )
+    elif not feeds_read:
+        result.note = ("SEPTA's real-time alert feeds couldn't be read, so recent closures, shuttle "
+                       "buses or platform changes may be missing.")
+    return result
+
+
+def _json_alerts(data: Any) -> list[dict]:
+    """The JSON alerts API's rows, in alerts()'s shape."""
     out = []
     for r in data if isinstance(data, list) else []:
         rid = str(r.get("route_id", ""))
@@ -404,7 +475,7 @@ def alerts() -> list[dict]:
                 if v:
                     alert[key] = v
         out.append(alert)
-    return out + _gtfsrt_alerts(out)
+    return out
 
 
 # GTFS route_id -> the line name the JSON alerts API uses for Regional Rail.
@@ -428,18 +499,20 @@ def _when(ts: int) -> str:
     return datetime.fromtimestamp(ts, TZ).strftime("%b %d, %Y %I:%M %p").replace(" 0", " ")
 
 
-def _gtfsrt_alerts(have: list[dict], now: datetime | None = None) -> list[dict]:
+def _gtfsrt_alerts(have: list[dict], now: datetime | None = None) -> tuple[list[dict], bool]:
     """Alerts in SEPTA's GTFS-realtime feeds that aren't already in `have` (the JSON
-    API's), in the same shape. Alerts that name only trips (single cancelled bus trips)
-    are left out."""
+    API's), in the same shape, and whether any feed could be read. Alerts that name only
+    trips (single cancelled bus trips) are left out."""
     parsed = []
+    feeds_read = False
     for path in GTFSRT_ALERT_PATHS:
         try:
             parsed += _cached(
-                GTFSRT_BASE + path, lambda url: gtfsrt.parse_alerts(_fetch_bytes(url)), ALERTS_CACHE_SECONDS
+                GTFSRT_BASE + path, lambda url: gtfsrt.parse_alerts(_fetch_bytes(url)), GTFSRT_ALERTS_CACHE_SECONDS
             )
+            feeds_read = True
         except (SeptaAPIError, ValueError, IndexError):
-            continue  # the JSON alerts still stand
+            continue  # the other source's alerts still stand
     seen = " ".join(_squash(a.get(k)) for a in have for k in ("current", "advisory", "detour"))
     now_ts = (now or datetime.now(TZ)).timestamp()
     out = []
@@ -481,11 +554,14 @@ def _gtfsrt_alerts(have: list[dict], now: datetime | None = None) -> list[dict]:
             elif not _METRO_ROUTE.match(r):
                 out.append({"route_id": r, "route_name": r, "mode": "bus",
                             **(detour if a.effect == "detour" else advisory), **common})
+    return out, feeds_read
+
+
+def rail_alerts() -> AlertList:
+    every = alerts()
+    out = AlertList(a for a in every if a["mode"] in ("regional_rail", "systemwide"))
+    out.note = every.note
     return out
-
-
-def rail_alerts() -> list[dict]:
-    return [a for a in alerts() if a["mode"] in ("regional_rail", "systemwide")]
 
 
 # TransitView's "late" when the vehicle has no schedule estimate.

@@ -825,6 +825,7 @@ async def service_alerts(
         alerts = await anyio.to_thread.run_sync(realtime.alerts)
     except realtime.SeptaAPIError as e:
         return {"error": str(e)}
+    partial = {"alerts_note": alerts.note} if alerts.note else {}
     for a in alerts:
         if a["mode"] == "metro":
             a["lines"] = _alert_lines(a)
@@ -832,19 +833,19 @@ async def service_alerts(
         alerts = [a for a in alerts if a["mode"] in (mode, "systemwide")]
     if line:
         matched = _match_alerts(alerts, line)
-        result: dict = {"line": line, "alerts": matched, "count": len(matched)}
+        result: dict = {"line": line, "alerts": matched, "count": len(matched), **partial}
         if not any(a["mode"] != "systemwide" for a in matched):
             result["note"] = f"No current alerts for '{line}'."
             result.update(_lines_with_alerts(alerts))
         return result
     if mode is None:
         shown = [a for a in alerts if a["mode"] != "bus"]
-        result = {"alerts": shown, "count": len(shown)}
+        result = {"alerts": shown, "count": len(shown), **partial}
         if len(shown) < len(alerts):
             result["bus_routes_with_alerts"] = _lines_with_alerts(alerts)["bus_routes_with_alerts"]
             result["note"] = "Bus alerts aren't listed here; pass line='<route>' or mode='bus' for them."
         return result
-    return {"alerts": alerts, "count": len(alerts)}
+    return {"alerts": alerts, "count": len(alerts), **partial}
 
 
 def _lines_with_alerts(alerts: list[dict]) -> dict:
