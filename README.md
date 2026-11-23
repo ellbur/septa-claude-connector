@@ -153,6 +153,13 @@ answer in under a second and carry the time-sensitive alerts, so they're cached 
 minute. If either source can't be read, the other's alerts are returned with an
 `alerts_note` saying what may be missing.
 
+MCP has no way to return part of a tool's answer and the rest later, so a slow JSON API
+can't be waited out without stalling the model. Instead the server starts fetching it at
+startup, and when nothing is cached yet (just after a cold start), a call waits at most 3
+seconds for it, then answers with the GTFS-realtime alerts and an `alerts_note` to call
+`service_alerts` again in about 20 seconds. The fetch carries on in the background, so by
+then the full list is cached.
+
 ## Run it
 
 Requires Python 3.11+.
@@ -271,6 +278,7 @@ For local use only, point a desktop MCP client at the stdio command instead:
 | `SEPTA_ALERTS_CACHE_SECONDS` | `1200` | How long the JSON API's alerts are used before being refreshed in the background |
 | `SEPTA_ALERTS_MAX_STALE_SECONDS` | `21600` | How long past that they're still used while refreshing fails |
 | `SEPTA_ALERTS_TIMEOUT` | `30` | Seconds to wait for the JSON alerts API, which is slow |
+| `SEPTA_ALERTS_WAIT_SECONDS` | `3` | With nothing cached, how long a call waits for the JSON alerts before answering without them |
 | `SEPTA_GTFSRT_ALERTS_CACHE_SECONDS` | `60` | How long the GTFS-realtime alert feeds are reused |
 | `SEPTA_API_MAX_PER_MINUTE` | `60` | Most real-time requests sent to SEPTA in any 60 seconds (per process) |
 | `MCP_TRANSPORT`, `HOST`, `PORT` | `stdio`, `0.0.0.0`, `8000` | Server transport settings |

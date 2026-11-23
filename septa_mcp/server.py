@@ -216,7 +216,7 @@ def _station_alerts(*stations) -> dict:
     except realtime.SeptaAPIError as e:
         return {"alerts_error": str(e)}
     relevant = _alerts_for_lines(alerts, [feed.route_name(r) for r in routes])
-    return {"service_alerts": relevant} if relevant else {}
+    return {"service_alerts": relevant, **_partial(alerts)} if relevant else _partial(alerts)
 
 
 # ---------------------------------------------------------------------------
@@ -825,7 +825,7 @@ async def service_alerts(
         alerts = await anyio.to_thread.run_sync(realtime.alerts)
     except realtime.SeptaAPIError as e:
         return {"error": str(e)}
-    partial = {"alerts_note": alerts.note} if alerts.note else {}
+    partial = _partial(alerts)
     for a in alerts:
         if a["mode"] == "metro":
             a["lines"] = _alert_lines(a)
@@ -903,7 +903,12 @@ def _metro_alerts(*stations) -> dict:
         for a in alerts
         if a["mode"] == "systemwide" or set(_alert_lines(a)) & lines
     ]
-    return {"service_alerts": relevant} if relevant else {}
+    return {"service_alerts": relevant, **_partial(alerts)} if relevant else _partial(alerts)
+
+
+def _partial(alerts) -> dict:
+    """alerts_note, when some of SEPTA's alerts couldn't be read (or are still loading)."""
+    return {"alerts_note": alerts.note} if getattr(alerts, "note", None) else {}
 
 
 def _alert_lines(a: dict) -> list[str]:
@@ -940,7 +945,9 @@ def _metro_trip_alerts(lines: set[str], names: list[str]) -> dict:
             or any(_alert_mentions(a, n) for n in names)
         )
     ]
-    return {"service_alerts": relevant, "alerts_note": ALERTS_NOTE} if relevant else {}
+    if not relevant:
+        return _partial(alerts)
+    return {"service_alerts": relevant, "alerts_note": " ".join(filter(None, [ALERTS_NOTE, alerts.note]))}
 
 
 def _metro_alerts_about(names: list[str]) -> dict:
@@ -955,7 +962,7 @@ def _metro_alerts_about(names: list[str]) -> dict:
         for a in alerts
         if a["mode"] == "metro" and any(_alert_mentions(a, n) for n in names)
     ]
-    return {"service_alerts": about} if about else {}
+    return {"service_alerts": about, **_partial(alerts)} if about else _partial(alerts)
 
 
 def _not_named(feed, query: str, st) -> bool:
@@ -1428,7 +1435,7 @@ def _bus_alerts(feed, routes: set[str]) -> dict:
         a for a in alerts
         if a["mode"] == "systemwide" or (a["mode"] == "bus" and str(a.get("route_name", "")).lower() in names)
     ]
-    return {"service_alerts": relevant} if relevant else {}
+    return {"service_alerts": relevant, **_partial(alerts)} if relevant else _partial(alerts)
 
 
 def _corner_dict(feed, corner) -> dict:
@@ -1956,6 +1963,8 @@ def main() -> None:
                 log.warning("%s", e)
         return
 
+    # SEPTA's alerts API takes ~15 s to answer, so start on it while the timetables load.
+    realtime.warm_alerts()
     # Load (and if needed download) the timetable up front so the first question is fast.
     log.info("Loaded SEPTA rail schedule: %s", feeds.get().summary())
     for kind in ("metro", "bus"):

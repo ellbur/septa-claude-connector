@@ -45,6 +45,9 @@ MAX_PER_MINUTE = int(os.environ.get("SEPTA_API_MAX_PER_MINUTE", "60"))
 ALERTS_CACHE_SECONDS = float(os.environ.get("SEPTA_ALERTS_CACHE_SECONDS", "1200"))
 ALERTS_MAX_STALE_SECONDS = float(os.environ.get("SEPTA_ALERTS_MAX_STALE_SECONDS", str(6 * 3600)))
 ALERTS_TIMEOUT = float(os.environ.get("SEPTA_ALERTS_TIMEOUT", "30"))
+# With nothing cached (e.g. just after a cold start), how long a call waits for the JSON
+# alerts before answering with the GTFS-realtime alerts alone and a note to ask again.
+ALERTS_WAIT_SECONDS = float(os.environ.get("SEPTA_ALERTS_WAIT_SECONDS", "3"))
 GTFSRT_ALERTS_CACHE_SECONDS = float(os.environ.get("SEPTA_GTFSRT_ALERTS_CACHE_SECONDS", "60"))
 TZ = ZoneInfo("America/New_York")
 
@@ -99,8 +102,13 @@ class SeptaAPIError(RuntimeError):
     pass
 
 
+class SeptaPending(SeptaAPIError):
+    """The answer is still being fetched in the background; ask again shortly."""
+
+
 _cache: dict[str, tuple[float, float, Any]] = {}  # url -> (fresh until, usable until, data)
 _url_locks: dict[str, threading.Lock] = {}
+_errors: dict[str, Exception] = {}  # url -> why its last background fetch failed
 _sent: list[float] = []  # times of requests sent in the last minute
 _lock = threading.Lock()
 
@@ -109,6 +117,7 @@ def clear_cache() -> None:
     with _lock:
         _cache.clear()
         _sent.clear()
+        _errors.clear()
 
 
 def _take_slot(now: float) -> float:
@@ -123,19 +132,23 @@ def _take_slot(now: float) -> float:
 
 
 def _get(path: str, params: dict[str, Any] | None = None, ttl: float | None = None,
-         stale: float = 0, timeout: float | None = None) -> Any:
+         stale: float = 0, timeout: float | None = None, wait: float | None = None) -> Any:
     q = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
     url = f"{BASE_URL}{path}"
     if q:
         url += "?" + urllib.parse.urlencode(q)
-    return _cached(url, lambda u: _fetch(u, timeout), ttl, stale)
+    return _cached(url, lambda u: _fetch(u, timeout), ttl, stale, wait)
 
 
-def _cached(url: str, fetch, ttl: float | None = None, stale: float = 0) -> Any:
+def _cached(url: str, fetch, ttl: float | None = None, stale: float = 0, wait: float | None = None) -> Any:
     """fetch(url), or its answer from the last ttl (default CACHE_SECONDS) seconds.
 
     With stale > 0, an answer up to `stale` seconds past its ttl is still returned at once
     while a background thread fetches a new one; if that fails, the old answer stays.
+
+    With wait set and no answer to use, the fetch runs in the background and the caller
+    waits at most `wait` seconds for it, then gets SeptaPending; the fetch carries on, so
+    asking again later gets its answer (or its error).
     """
     ttl = CACHE_SECONDS if ttl is None else ttl
     with _lock:
@@ -145,9 +158,21 @@ def _cached(url: str, fetch, ttl: float | None = None, stale: float = 0) -> Any:
     if hit and hit[0] > now:
         return hit[2]
     if hit and hit[1] > now:
-        if url_lock.acquire(blocking=False):  # else a refresh is already under way
-            threading.Thread(target=_refresh, args=(url, fetch, ttl, stale, url_lock), daemon=True).start()
+        _start_refresh(url, fetch, ttl, stale, url_lock)
         return hit[2]
+    if wait is not None:
+        _start_refresh(url, fetch, ttl, stale, url_lock)
+        done = url_lock.acquire(timeout=wait) if wait > 0 else False
+        if done:
+            url_lock.release()
+        with _lock:
+            hit = _cache.get(url)
+            error = _errors.get(url)
+        if hit and hit[1] > time.monotonic():
+            return hit[2]
+        if done and error:
+            raise error
+        raise SeptaPending("still being fetched")
     # One request per URL at a time, so concurrent callers wait for the first one's answer.
     with url_lock:
         with _lock:
@@ -157,11 +182,20 @@ def _cached(url: str, fetch, ttl: float | None = None, stale: float = 0) -> Any:
         return _fetch_and_store(url, fetch, ttl, stale)
 
 
+def _start_refresh(url: str, fetch, ttl: float, stale: float, url_lock: threading.Lock) -> None:
+    """Fetch url in a background thread, unless a fetch of it is already under way."""
+    if url_lock.acquire(blocking=False):
+        with _lock:
+            _errors.pop(url, None)
+        threading.Thread(target=_refresh, args=(url, fetch, ttl, stale, url_lock), daemon=True).start()
+
+
 def _refresh(url: str, fetch, ttl: float, stale: float, url_lock: threading.Lock) -> None:
     try:
         _fetch_and_store(url, fetch, ttl, stale)
-    except Exception:  # noqa: BLE001 - the old answer stays until it's too old
-        pass
+    except Exception as e:  # noqa: BLE001 - any old answer stays until it's too old
+        with _lock:
+            _errors[url] = e
     finally:
         url_lock.release()
 
@@ -417,19 +451,32 @@ def alerts() -> AlertList:
     feeds (station closures, Metro shuttle buses, platform changes, elevator outages), so
     those are added from there. If either source can't be read, the other's alerts are
     still returned, with a note saying what may be missing; if neither can, SeptaAPIError.
+
+    The JSON API is slow, so with nothing cached this waits only ALERTS_WAIT_SECONDS for it;
+    if it hasn't answered by then, the note says to ask again shortly, by when it will have.
     """
     try:
-        data = _get("/Alerts/get_alert_data.php", ttl=ALERTS_CACHE_SECONDS,
-                    stale=ALERTS_MAX_STALE_SECONDS, timeout=ALERTS_TIMEOUT)
+        data = _json_alerts_data(ALERTS_WAIT_SECONDS)
         json_error = None
     except SeptaAPIError as e:
         data, json_error = [], e
     out = _json_alerts(data)
     extra, feeds_read = _gtfsrt_alerts(out)
+    pending = isinstance(json_error, SeptaPending)
     if json_error and not feeds_read:
+        if pending:
+            raise SeptaPending(f"SEPTA's alerts are still loading (its alerts API takes about "
+                               f"{ALERTS_RETRY_HINT} seconds to answer). Try again in about {ALERTS_RETRY_HINT} seconds.")
         raise json_error
     result = AlertList(out + extra)
-    if json_error:
+    if pending:
+        result.note = (
+            "Only the alerts from SEPTA's real-time feeds (closed stations, shuttle buses, platform "
+            "changes, some detours) are shown: its main alerts list, with the other advisories and "
+            f"detours, is still loading (its API takes about {ALERTS_RETRY_HINT} seconds to answer). "
+            f"Call service_alerts again in about {ALERTS_RETRY_HINT} seconds for the full list."
+        )
+    elif json_error:
         result.note = (
             f"SEPTA's main alerts list couldn't be read ({json_error}), so only the alerts in its "
             "real-time feeds (closed stations, shuttle buses, platform changes, some detours) are "
@@ -439,6 +486,24 @@ def alerts() -> AlertList:
         result.note = ("SEPTA's real-time alert feeds couldn't be read, so recent closures, shuttle "
                        "buses or platform changes may be missing.")
     return result
+
+
+ALERTS_PATH = "/Alerts/get_alert_data.php"
+ALERTS_RETRY_HINT = 20  # seconds; SEPTA's alerts API has been taking ~15
+
+
+def _json_alerts_data(wait: float | None) -> Any:
+    return _get(ALERTS_PATH, ttl=ALERTS_CACHE_SECONDS, stale=ALERTS_MAX_STALE_SECONDS,
+                timeout=ALERTS_TIMEOUT, wait=wait)
+
+
+def warm_alerts() -> None:
+    """Start fetching the JSON alerts in the background (at startup), so they're cached by
+    the time someone asks."""
+    try:
+        _json_alerts_data(0)
+    except SeptaAPIError:
+        pass
 
 
 def _json_alerts(data: Any) -> list[dict]:
